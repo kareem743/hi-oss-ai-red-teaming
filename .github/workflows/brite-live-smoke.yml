@@ -1,0 +1,32 @@
+name: BRITE live access smoke check
+on:
+  push:
+    branches: ['brite/cloudflare-pilot']
+    paths: ['.github/workflows/brite-live-smoke.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unauthenticated:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no unauthenticated access to pilot
+        run: |
+          python - <<'PY'
+          import urllib.request, urllib.error, urllib.parse
+          base='https://brite-redteam-api.kareem-rag-tools.workers.dev'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          opener=urllib.request.build_opener(NoRedirect)
+          for path in ('/', '/api/me', '/api/campaigns'):
+              try:
+                  response=opener.open(base+path, timeout=20)
+              except urllib.error.HTTPError as exc:
+                  response=exc
+              status=response.code
+              loc=response.headers.get('Location','')
+              dest=urllib.parse.urlsplit(loc).hostname or ''
+              print(path, 'HTTP', status, 'redirect host:', dest)
+              assert status in (401,403) or (status in (301,302,303,307,308) and dest.endswith('.cloudflareaccess.com')), 'Expected Access challenge, not a public response'
+          PY

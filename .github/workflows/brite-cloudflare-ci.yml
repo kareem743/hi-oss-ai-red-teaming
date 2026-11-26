@@ -42,29 +42,34 @@ jobs:
         working-directory: brite-cloudflare
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - uses: astral-sh/setup-uv@v6
-      - name: Install Cloudflare build CLI
-        run: npm install --no-save --no-audit --no-fund cf@latest
-      - name: Install Python Worker tooling
-        run: uv sync --group dev
-      - name: Vendor Pyodide-compatible Python dependencies
-        run: uv run pywrangler sync
-      - name: Build Python Worker for Cloudflare (no credentials)
-        run: uv run npx cf build
-      - name: Retain deployable output
-        if: always()
+      - name: Build frontend
+        run: cd frontend && npm install --no-audit --no-fund && npm run build
+      - name: Resolve and vendor Pyodide packages
+        shell: bash
+        run: |
+          uv venv .venv-pyodide --python cpython-3.14.2-emscripten-wasm32-musl
+          printf 'workers-runtime-sdk==1.9.7\n' > /tmp/brite-worker-sdk.in
+          uv pip compile pyproject.toml /tmp/brite-worker-sdk.in --python cpython-3.14.2-emscripten-wasm32-musl --extra-index-url https://index.pyodide.org/314.0.7 --index-strategy unsafe-best-match --no-build -o /tmp/brite-worker-lock.txt
+          VIRTUAL_ENV="$PWD/.venv-pyodide" uv pip install --only-binary :all: -r /tmp/brite-worker-lock.txt
+          cp -a .venv-pyodide/lib/python3.14/site-packages python_modules
+          touch python_modules/pyvenv.cfg
+          du -sh python_modules
+      - name: Retain deployable source and dependencies
         uses: actions/upload-artifact@v4
         with:
-          name: brite-python-worker-build
+          name: brite-python-worker-package
           path: |
-            brite-cloudflare/.cloudflare/output/v1/
+            brite-cloudflare/src/
             brite-cloudflare/python_modules/
+            brite-cloudflare/frontend/dist/
+            brite-cloudflare/cloudflare.config.ts
           include-hidden-files: true
           retention-days: 3
           if-no-files-found: error

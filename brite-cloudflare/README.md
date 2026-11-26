@@ -1,3 +1,5 @@
+> **Deployment update:** The D1 database, Access application and initial administrator are provisioned. A protected diagnostic Worker is deployed; the full application is not deployed yet. For the packaged build and current single-host release procedure, see [Deployment handoff](DEPLOY.md). The older local-development and architecture notes below are retained for reference; follow the handoff for production configuration.
+
 # BRITE red-teaming · Cloudflare pilot
 
 A new pilot implementation inspired by the Humane Intelligence open-source red-teaming workflow, based on its actual repository and BRITE's stated design. This is not a complete port of the upstream codebase. See [parity and gaps](docs/PARITY.md).

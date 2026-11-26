@@ -1,17 +1,15 @@
-"""Cloudflare adapter. Trusted identity is provided by Access, never a header."""
-import asgi
-from workers import WorkerEntrypoint
+"""Cloudflare single-host adapter. Identity is derived only from a validated Access JWT."""
+from workers import WorkerEntrypoint,asgi
 from src.app import app,reap
+from src.access import verified_email
 
 class Default(WorkerEntrypoint):
     async def fetch(self,request):
-        access=getattr(self.ctx,'access',None)
-        identity=await access.getIdentity() if access is not None else None
-        email=str(identity.email).lower() if identity is not None and getattr(identity,'email',None) else None
         env=self.env
+        email=await verified_email(request,env)
         async def scoped(scope,receive,send):
             scope['brite_env']=env;scope['brite_email']=email
             await app(scope,receive,send)
-        return await asgi.fetch(scoped,request,self.env)
-    async def scheduled(self,controller,env,ctx):
-        await reap(env)
+        return await asgi.fetch(scoped,request,env)
+    async def scheduled(self,controller):
+        await reap(self.env)

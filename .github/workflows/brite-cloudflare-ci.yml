@@ -51,8 +51,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install Cloudflare build CLI
         run: npm install --no-save --no-audit --no-fund cf@latest
+      - name: Install Python Worker tooling
+        run: uv sync --group dev
       - name: Build Python Worker for Cloudflare (no credentials)
-        run: npx cf build
+        run: uv run npx cf build
       - name: Retain deployable output
         if: success()
         uses: actions/upload-artifact@v4

@@ -1,0 +1,14 @@
+[project]
+name = "brite-redteam-cloudflare"
+version = "0.2.0"
+requires-python = ">=3.13,<3.15"
+dependencies = ["fastapi>=0.115,<1", "httpx>=0.28,<1", "pydantic>=2,<3"]
+[dependency-groups]
+dev = ["pytest>=8", "uvicorn>=0.30"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]

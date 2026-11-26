@@ -33,12 +33,12 @@ npm run dev
 
 Open http://localhost:5173. Local demo binds to loopback and fixes the identity server-side, using `admin@example.org` by default. It is **not** Cloudflare Access, and the mock output is explicitly labeled synthetic. Do not deploy `local_demo.py` or `tests/`. As admin create `volunteer@example.org` and `reviewer@example.org`, a campaign, scenario, task and target model, then assign the users and activate the campaign. To switch roles, stop the local API and start it with `DEMO_USER=volunteer@example.org python local_demo.py` or `DEMO_USER=reviewer@example.org python local_demo.py`. Reload the browser. SQLite persists locally in `demo.sqlite`. To reset, stop local servers and remove that local file only. No real model API calls occur in this demo.
 
-## Cloudflare deployment checklist (not executed)
+## Cloudflare deployment checklist (database prepared; application not deployed)
 
 The provided `cloudflare.config.ts` follows the Cloudflare `cf` project configuration shape, using the `python_workers` compatibility flag and D1 binding. Treat the config as a candidate until validated by the installed Cloudflare CLI. Cloudflare's Python Workers runtime, context/ASGI adapter, HTTPX streaming, FFI result conversion and scheduling must all pass real smoke tests. Do not enable volunteers until validation is complete.
 
 1. Install and authenticate the Cloudflare `cf` CLI according to [current installation instructions](https://developers.cloudflare.com/cf/). Confirm the installed version supports Python projects, the `cf/config` module and the config's keys. Run `cf cli search` for exact syntax of deployment, secrets, migration and routing commands; these can change with the CLI version. The Python project depends on FastAPI, HTTPX and Pydantic; ensure the current Python Workers toolchain packages these successfully. If needed, adjust packaging to the current official FastAPI template.
-2. Create a **new** D1 database named `brite-redteam-db`; apply `migrations/0001_pilot.sql` using D1 migrations or the D1 dashboard SQL import. This is a new schema, not an upgrade of a live upstream database. [D1 docs](https://developers.cloudflare.com/d1/).
+2. For the existing BRITE pilot account, a new D1 database named `brite-redteam-db` has already been created and `0001_pilot.sql` applied using the D1 API. The migration is recorded in `d1_migrations`; the 12 application tables and seven named indexes were verified, with no foreign-key violations and no user data. Do not recreate it or apply the initial schema again manually. For a separate account, create a new database and apply the migration normally. [D1 docs](https://developers.cloudflare.com/d1/).
 3. Seed a real approved administrator through the authenticated D1 dashboard, replacing the placeholder email with the exact Access email:
 
    ```sql
@@ -53,7 +53,7 @@ The provided `cloudflare.config.ts` follows the Cloudflare `cf` project configur
 8. Confirm the cron trigger runs every 15 minutes and reaps stale turns. Verify audit records, logs, D1 backups/recovery and costs. Add a retention policy and cap API spend before enrolling real volunteers.
 9. Run the acceptance matrix below with actual separate users and real provider calls on synthetic data only. If Python runtime compatibility or free CPU budget is inadequate, first profile on the paid Workers plan; if incompatibility persists, port the backend adapter or API to TypeScript. Paid does not fix every packaging or startup limit.
 
-**Deployment status:** no production Cloudflare resources were created, no upstream repository was changed, no GitHub fork created, no paid calls made. npm installation was blocked by DNS in the build environment, so the frontend bundle and browser UI were not built or tested. The actual Cloudflare toolchain and identity context remain unverified. Current tests use SQLite rather than real D1.
+**Deployment status (2026-11-26):** the pilot is committed on the fork branch `brite/cloudflare-pilot`, under `brite-cloudflare/`. The dedicated D1 database and migration are ready; neither Worker has been deployed. Cloudflare Access is not enabled on the connected account (Access API returned `access.api.error.not_enabled`). Enable Access through the Cloudflare dashboard before deploying or granting volunteer access. Choose the hostname, verify the administrator identity, and configure the provider keys privately. No users, research records, or provider keys were written. npm installation was blocked by DNS in the local build environment, so the frontend bundle and browser UI were not built or tested there. The Cloudflare Python toolchain and identity context remain unverified. The API integration test uses a SQLite test double; the live D1 schema was separately verified. No plan upgrade or paid AI call was performed.
 
 ## Acceptance matrix
 
@@ -80,8 +80,12 @@ Initial target $0–$5/month for a small pilot, subject to actual Worker CPU, re
 
 ## Fork and integrate
 
-The available GitHub connector did not expose fork creation or repository creation. Create a BRITE-owned fork via https://github.com/humane-intelligence/hi-oss-ai-red-teaming/fork . The upstream project is public; a fork may also be public. Keep credentials, real research data and private settings out of it. If private hosting is required, use an approved private repository instead, retaining upstream attribution and license obligations when copying source. After cloning your fork, create branch `brite/cloudflare-pilot`, place this entire project in `cloudflare-pilot/`, and commit that directory. Do not edit upstream deployment files until pilot validation. A pull request can then document the migration and parity gaps.
+The pilot lives alongside upstream source on the fork's `brite/cloudflare-pilot` branch under `brite-cloudflare/`. The original `main` branch and the upstream repository remain unchanged. The fork is public; never commit credentials, research records, or private configuration. If private development is required, use an approved private repository while retaining required upstream license and attribution. A pull request should document parity gaps and should not be merged or deployed to an existing site before validation.
 
 ## Validation performed
 
 `python -m pytest -q`: 1 comprehensive end-to-end test passed (multiple positive and negative API assertions). `python -m compileall`: passed. JSX transpilation using installed TypeScript compiler: syntax passed. npm install: blocked (DNS EAI_AGAIN). No live deploy, no provider network calls, no browser screenshot claimed.
+
+## GitHub build verification
+
+The dedicated BRITE CI workflow checks the Python integration test and builds the React/Vite frontend in GitHub Actions. It does not deploy resources, access production secrets, or make AI provider calls. Forks may need Actions enabled explicitly; confirm the workflow run results before treating the build as verified.

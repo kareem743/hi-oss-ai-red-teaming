@@ -53,14 +53,18 @@ jobs:
         run: npm install --no-save --no-audit --no-fund cf@latest
       - name: Install Python Worker tooling
         run: uv sync --group dev
+      - name: Vendor Pyodide-compatible Python dependencies
+        run: uv run pywrangler sync
       - name: Build Python Worker for Cloudflare (no credentials)
         run: uv run npx cf build
       - name: Retain deployable output
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: brite-python-worker-build
-          path: brite-cloudflare/.cloudflare/output/v1/
+          path: |
+            brite-cloudflare/.cloudflare/output/v1/
+            brite-cloudflare/python_modules/
           include-hidden-files: true
           retention-days: 3
           if-no-files-found: error

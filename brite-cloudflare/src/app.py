@@ -44,7 +44,10 @@ async def security(req:Request,call_next):
     # Same-origin-only mutations; Access authentication is independent of this check.
     if req.method not in ('GET','HEAD','OPTIONS'):
         origin=req.headers.get('origin'); expected=getattr(req.scope.get('brite_env'),'APP_ORIGIN','')
-        if origin and origin!=expected: return Response('Origin not allowed',403)
+        if not expected or (origin!=expected and not (origin is None and req.scope.get('brite_test_provider'))): return Response('Origin not allowed',403)
+        if req.headers.get('sec-fetch-site') in ('cross-site','same-site'): return Response('Origin not allowed',403)
+        length=req.headers.get('content-length')
+        if length and (not length.isdigit() or int(length)>128000): return Response('Request too large',413)
     res=await call_next(req); res.headers['Cache-Control']='no-store';res.headers['X-Content-Type-Options']='nosniff';return res
 
 class UserInput(BaseModel):
@@ -155,6 +158,9 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     for r in rows:
         if r['status']=='complete':history.extend([{'role':'user','content':r['prompt']},{'role':'assistant','content':r['response']}])
     history.append({'role':'user','content':p.prompt})
+    if sum(len(x['content']) for x in history)>80000: fail(409,'Conversation context limit reached. Start a new chat.')
+    allowance=await d.one("INSERT INTO model_daily_usage(email,day,requests) VALUES(?,date('now'),1) ON CONFLICT(email,day) DO UPDATE SET requests=requests+1 WHERE requests<50 RETURNING requests",u['email'])
+    if not allowance: fail(429,'Daily limit of 50 model requests reached.')
     id=uid();seq=rows[-1]['seq']+1 if rows else 1
     # Atomic reservation: simultaneous sends cannot reserve the same sequence or another pending turn.
     try:
@@ -266,8 +272,8 @@ async def workspace_assignment(d,u,c,emails):
     result=[]
     for e in dict.fromkeys(normalize_email(x) for x in emails):
         existing=await d.one('SELECT role,active FROM users WHERE email=?',e)
-        if existing and (existing['role']!='volunteer' or not existing['active']): fail(409,'An assigned email is not an active volunteer.')
-        result.extend([('INSERT OR IGNORE INTO users(email,role,active,trained) VALUES(?,\'volunteer\',1,0)',(e,)),('INSERT OR IGNORE INTO memberships(campaign_id,email) VALUES(?,?)',(c,e))])
+        if not existing or existing['role']!='volunteer' or not existing['active']: fail(409,'Select an approved, active volunteer.')
+        result.append(('INSERT OR IGNORE INTO memberships(campaign_id,email) VALUES(?,?)',(c,e)))
     return result
 
 @app.get('/api/workspace/scenarios')
@@ -350,3 +356,18 @@ async def workspace_flag(req:Request,c:str,p:WorkspaceFlag,u=Depends(current)):
     id=uid()
     await d.batch([("INSERT INTO findings(id,conversation_id,turn_id,author,category,severity,explanation,expected) SELECT ?,?,?,?,'other','moderate',?,'' WHERE NOT EXISTS(SELECT 1 FROM findings WHERE conversation_id=? AND turn_id=? AND author=?)",(id,c,p.turn_id,u['email'],p.reason.strip() or 'Flagged for reviewer attention.',c,p.turn_id,u['email'])),audit(u,'response.flag',id)])
     return {'ok':True}
+
+
+@app.get('/api/workspace/model-catalog')
+async def workspace_catalog(req:Request,u=Depends(current)):
+    role(u,'admin')
+    env=req.scope['brite_env']
+    async def load(provider):
+        if not providers.configured(env,provider):
+            return {'provider':provider,'status':'not_configured','models':[]}
+        try:
+            models=await providers.catalog(env,provider)
+            return {'provider':provider,'status':'connected','models':models}
+        except Exception:
+            return {'provider':provider,'status':'unavailable','models':[]}
+    return await asyncio.gather(load('openai'),load('anthropic'))

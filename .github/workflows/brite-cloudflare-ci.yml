@@ -3,14 +3,14 @@ on:
   push:
     branches:
       - 'brite/cloudflare-pilot'
-    paths:
-      - 'brite-cloudflare/**'
-      - '.github/workflows/brite-cloudflare-ci.yml'
+  pull_request:
+    branches: ['brite/cloudflare-pilot']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   backend:
+    timeout-minutes: 12
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -20,9 +20,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python -m pip install -e . pytest uvicorn
+      - run: python -m pip install -e . pytest pytest-cov uvicorn
       - run: python -m compileall -q src tests
-      - run: python -m pytest -q
+      - run: python -m pytest -q --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=70
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -34,8 +34,45 @@ jobs:
         with:
           node-version: '22'
       - run: npm install --no-audit --no-fund
+      - run: npm test
       - run: npm run build
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: brite-cloudflare/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run test:db
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cd brite-cloudflare && python -m pip install -e . uvicorn
+      - run: cd brite-cloudflare/frontend && npm install --no-audit --no-fund && npm run build
+      - run: cd brite-cloudflare/frontend && npx playwright install --with-deps chromium
+      - run: cd brite-cloudflare/frontend && npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-report
+          path: brite-cloudflare/frontend/playwright-report/
+          retention-days: 7
   worker-package:
+    needs: [backend, frontend, database, browser]
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -73,3 +110,18 @@ jobs:
           include-hidden-files: true
           retention-days: 3
           if-no-files-found: error
+  quality-gate:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [backend, frontend, database, browser, worker-package]
+    steps:
+      - name: Reject failed or skipped required checks
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json,os
+          results=json.loads(os.environ['RESULTS'])
+          print({k:v['result'] for k,v in results.items()})
+          assert all(v['result']=='success' for v in results.values()), 'Required quality check failed'
+          PY

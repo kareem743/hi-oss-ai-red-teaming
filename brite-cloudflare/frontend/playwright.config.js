@@ -1,0 +1,2 @@
+import {defineConfig} from '@playwright/test';
+export default defineConfig({testDir:'./e2e',workers:1,retries:0,timeout:45000,use:{browserName:'chromium',baseURL:'http://127.0.0.1:8765',trace:'retain-on-failure'},webServer:{command:'cd .. && BRITE_CI_BROWSER=1 python -m tests.browser_server',url:'http://127.0.0.1:8765/',reuseExistingServer:false,timeout:30000},reporter:[['list'],['html',{open:'never'}]]});

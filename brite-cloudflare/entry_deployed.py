@@ -17,14 +17,10 @@ class Default(WorkerEntrypoint):
             if asset is None:
                 return Response('Not found', status=404)
             mime, encoded = asset
-            body = base64.b64decode(encoded)
+            body = gzip.decompress(base64.b64decode(encoded)).decode('utf-8')
             headers = {'Content-Type': mime, 'Cache-Control': 'no-store',
                        'X-Content-Type-Options': 'nosniff', 'Vary': 'Accept-Encoding',
                        'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}
-            if 'gzip' in (request.headers.get('accept-encoding') or '').lower():
-                headers['Content-Encoding'] = 'gzip'
-            else:
-                body = gzip.decompress(body)
             return Response(None if request.method == 'HEAD' else body, headers=headers)
         env = self.env
         email = await verified_email(request, env)
@@ -34,5 +30,5 @@ class Default(WorkerEntrypoint):
             await app(scope, receive, send)
         return await asgi.fetch(scoped, request, env)
 
-    async def scheduled(self, controller):
+    async def scheduled(self, controller, env, ctx):
         await reap(self.env)

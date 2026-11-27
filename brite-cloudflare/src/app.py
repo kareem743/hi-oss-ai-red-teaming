@@ -4,7 +4,8 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel,Field
 from .db import DB
-from . import providers
+from . import providers, vault, demo
+from types import SimpleNamespace
 app=FastAPI(title='BRITE | Red Teaming',version='0.2.0',docs_url=None,redoc_url=None,openapi_url=None)
 
 def uid(): return str(uuid.uuid4())
@@ -168,7 +169,17 @@ async def read_conversation(req:Request,c:str,u=Depends(current)):
 @app.post('/api/conversations/{c}/turns')
 async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     d=db(req);row=await own_open(d,u,c);model=json.loads(row['model_snapshot']);env=req.scope['brite_env']
-    if not getattr(env,'OPENAI_API_KEY' if model['provider']=='openai' else 'ANTHROPIC_API_KEY','') and not req.scope.get('brite_test_provider'):fail(503,'AI provider is not configured.')
+    is_demo=model['model_name']==demo.DEMO_ID
+    mock=req.scope.get('brite_test_provider')
+    paid=not is_demo and not mock
+    config=None;provider_env=env
+    if paid:
+        config=await registered_model(d,model['provider'],model['model_name'])
+        if not config:fail(503,'API model is not registered or enabled in Settings.')
+        try:
+            key=await vault.unseal(env,model['provider'],config['cipher'])
+        except Exception:fail(503,'API credential is unavailable.')
+        provider_env=SimpleNamespace(**{('OPENAI_API_KEY' if model['provider']=='openai' else 'ANTHROPIC_API_KEY'):key})
     rows=await d.all('SELECT seq,prompt,response,status FROM turns WHERE conversation_id=? ORDER BY seq',c)
     limits=await conversation_limits(d,row,rows,model)
     if not limits['no_limit'] and limits['turns_remaining']==0:fail(409,f"Conversation turn limit reached ({limits['max_turns']}).")
@@ -187,6 +198,10 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     size=limits['context_chars_used']+len(p.prompt)
     input_bytes=len((model.get('system_prompt') or '').encode('utf-8'))+sum(len(x['content'].encode('utf-8')) for x in history)
     if input_bytes>320000:fail(409,'Platform context safety limit reached.')
+    rate_in=config['input_cents'] if paid else 0;rate_out=config['output_cents'] if paid else 0
+    # Conservative estimate: UTF-8 bytes plus message framing allowance, full output allowance.
+    reserved=price_micros(input_bytes+64*len(history)+1024,model['max_tokens'],rate_in,rate_out) if paid else 0
+    provider=model['provider'];name=model['model_name'];pr=config['provider_revision'] if paid else -1;mr=config['model_revision'] if paid else -1
     try:
         await d.batch([
           ("""INSERT INTO turns(id,conversation_id,seq,prompt,status)
@@ -199,7 +214,11 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
           AND COALESCE((SELECT requests FROM model_monthly_usage WHERE month=?),0)<1000
           AND COALESCE((SELECT reserved_input_bytes FROM model_monthly_usage WHERE month=?),0)+?<=2000000
           AND COALESCE((SELECT output_token_allowance FROM model_monthly_usage WHERE month=?),0)+?<=512000
-          AND NOT EXISTS(SELECT 1 FROM turns t JOIN conversations v ON v.id=t.conversation_id WHERE v.owner=? AND t.status='pending')""",(id,c,seq,p.prompt,u['email'],u['email'],u['email'],day,u['email'],minute,ip_key,minute,month,month,input_bytes,month,model['max_tokens'],u['email'])),
+          AND NOT EXISTS(SELECT 1 FROM turns t JOIN conversations v ON v.id=t.conversation_id WHERE v.owner=? AND t.status='pending')
+          AND (?=0 OR (EXISTS(SELECT 1 FROM api_providers p JOIN api_models m ON m.provider=p.provider WHERE p.provider=? AND m.model_name=? AND p.enabled=1 AND m.enabled=1 AND p.cipher!='' AND p.revision=? AND m.revision=?)
+           AND (SELECT COUNT(*) FROM api_cost WHERE month=? AND provider=?)<(SELECT monthly_requests FROM api_providers WHERE provider=?)
+           AND COALESCE((SELECT SUM(cost_micros) FROM api_cost WHERE month=? AND provider=?),0)+?<=(SELECT budget_micros FROM api_providers WHERE provider=?)
+           AND COALESCE((SELECT SUM(cost_micros) FROM api_cost WHERE month=?),0)+?<=(SELECT budget_micros FROM api_budget WHERE id=1)))""",(id,c,seq,p.prompt,u['email'],u['email'],u['email'],day,u['email'],minute,ip_key,minute,month,month,input_bytes,month,model['max_tokens'],u['email'],int(paid),provider,name,pr,mr,month,provider,provider,month,provider,reserved,provider,month,reserved)),
           ("""INSERT INTO model_daily_usage(email,day,requests) SELECT ?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
             ON CONFLICT(email,day) DO UPDATE SET requests=requests+1""",(u['email'],day,id)),
           ("""INSERT INTO abuse_windows(kind,subject,window,requests) SELECT 'user',?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
@@ -208,28 +227,39 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
             ON CONFLICT(kind,subject,window) DO UPDATE SET requests=requests+1""",(ip_key,minute,id)),
           ("""INSERT INTO model_monthly_usage(month,requests,input_chars,output_token_allowance,reserved_input_bytes) SELECT ?,1,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
             ON CONFLICT(month) DO UPDATE SET requests=requests+1,input_chars=input_chars+excluded.input_chars,output_token_allowance=output_token_allowance+excluded.output_token_allowance,reserved_input_bytes=reserved_input_bytes+excluded.reserved_input_bytes""",(month,size,model['max_tokens'],input_bytes,id)),
-          ("""INSERT INTO model_usage(turn_id,email,scenario_id,model_id,input_chars,output_token_allowance) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)""",(id,u['email'],row['scenario_id'],row['model_id'],size,model['max_tokens'],id))
+          ("""INSERT INTO model_usage(turn_id,email,scenario_id,model_id,input_chars,output_token_allowance) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)""",(id,u['email'],row['scenario_id'],row['model_id'],size,model['max_tokens'],id)),
+          ("""INSERT INTO api_cost(turn_id,provider,model_name,month,cost_micros,reserved_micros,input_cents,output_cents,status) SELECT ?,?,?,?,?,?,?,?,'reserved' WHERE ?=1 AND EXISTS(SELECT 1 FROM turns WHERE id=?)""",(id,provider,name,month,reserved,reserved,rate_in,rate_out,int(paid),id))
         ])
     except Exception:fail(409,'Unable to reserve turn; refresh and retry.')
     if not await d.one('SELECT id FROM turns WHERE id=?',id):
         await d.batch([audit(u,'model.request_blocked',c)])
         fail(429,'Model request blocked by usage limits, concurrent request, or administrator pause.')
     def event(kind,**data):return 'data: '+json.dumps({'type':kind,**data})+'\n\n'
-    source=req.scope.get('brite_test_provider') or providers.chunks
+    source=demo.chunks if is_demo else (mock or providers.chunks)
+    model['_usage']={}
     async def stream():
         text='';yield event('start',turn_id=id)
         try:
-            async for piece in source(model,history,env):
+            async for piece in source(model,history,provider_env):
                 text+=piece
                 if len(text)>100000: raise RuntimeError('Response too large')
                 yield event('delta',text=piece)
             changed=await d.run("UPDATE turns SET response=?,status='complete' WHERE id=? AND status='pending'",text,id)
             await d.run('UPDATE model_usage SET output_chars=? WHERE turn_id=?',len(text),id)
             if changed!=1:raise RuntimeError('Turn expired')
+            if paid:
+                usage=model['_usage'];it=usage.get('input_tokens');ot=usage.get('output_tokens')
+                if type(it)==int and type(ot)==int and it>=0 and ot>=0:
+                    actual=price_micros(it,ot,rate_in,rate_out)
+                    await d.run("UPDATE api_cost SET cost_micros=?,input_tokens=?,output_tokens=?,status='reported' WHERE turn_id=?",actual,it,ot,id)
+                else:await d.run("UPDATE api_cost SET status='estimated' WHERE turn_id=?",id)
             yield event('done',turn_id=id)
         except (Exception,asyncio.CancelledError) as exc:
             try:await d.run("UPDATE turns SET response=?,status='failed',error='Stream interrupted or provider failed' WHERE id=? AND status='pending'",text,id)
             except Exception:pass
+            if paid:
+                try:await d.run("UPDATE api_cost SET status='estimated' WHERE turn_id=? AND status='reserved'",id)
+                except Exception:pass
             if isinstance(exc,asyncio.CancelledError):raise
             yield event('error',message='Model response could not be completed. Refresh to inspect the saved turn.')
     return StreamingResponse(stream(),media_type='text/event-stream',headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
@@ -303,7 +333,7 @@ class WorkspaceScenario(BaseModel):
     description: str = Field(min_length=1,max_length=12000)
     audience: Literal['public','private']
     emails: list[str] = Field(default_factory=list,max_length=20)
-    provider: Literal['openai','anthropic']
+    provider: Literal['openai','anthropic','demo']
     model_name: str = Field(min_length=1,max_length=200)
     model_label: str = Field(min_length=1,max_length=200)
     system_prompt: str = Field(default='',max_length=6000)
@@ -357,12 +387,16 @@ async def workspace_create(req:Request,p:WorkspaceScenario,u=Depends(current)):
     role(u,'admin');d=db(req)
     if not p.title.strip() or not p.description.strip() or not p.model_name.strip() or not p.model_label.strip(): fail(422,'Complete all required fields.')
     if p.audience=='private' and not p.emails: fail(422,'Assign at least one volunteer email.')
+    if p.provider=='demo':
+        if p.model_name!=demo.DEMO_ID:fail(422,'Invalid demo model.')
+    elif p.model_name==demo.DEMO_ID:fail(422,'Reserved demo model ID.')
+    elif not req.scope.get('brite_test_provider') and not await registered_model(d,p.provider,p.model_name):fail(409,'Register and enable this API model in Settings first.')
     c,s,m=uid(),uid(),uid()
     assignments=await workspace_assignment(d,u,c,p.emails)
     await d.batch([
         ("INSERT INTO campaigns(id,title,description,status,is_public) VALUES(?,?,?,'active',?)",(c,p.title.strip(),p.description.strip(),int(p.audience=='public'))),
         ('INSERT INTO scenarios(id,campaign_id,title,instructions,max_turns,max_context_chars,no_limit) VALUES(?,?,?,?,?,?,?)',(s,c,p.title.strip(),p.description.strip(),p.max_turns if p.max_turns is not None else 25,p.max_context_chars if p.max_context_chars is not None else 80000,int(p.no_limit))),
-        ('INSERT INTO models(id,campaign_id,label,provider,model_name,system_prompt) VALUES(?,?,?,?,?,?)',(m,c,p.model_label.strip(),p.provider,p.model_name.strip(),p.system_prompt)),
+        ('INSERT INTO models(id,campaign_id,label,provider,model_name,system_prompt) VALUES(?,?,?,?,?,?)',(m,c,('Demo' if p.provider=='demo' else p.model_label.strip()),('openai' if p.provider=='demo' else p.provider),p.model_name.strip(),p.system_prompt)),
         *assignments,audit(u,'scenario.create',s)
     ])
     return {'id':s,'campaign_id':c}
@@ -419,16 +453,14 @@ async def workspace_flag(req:Request,c:str,p:WorkspaceFlag,u=Depends(current)):
 @app.get('/api/workspace/model-catalog')
 async def workspace_catalog(req:Request,u=Depends(current)):
     role(u,'admin')
-    env=req.scope['brite_env']
-    async def load(provider):
-        if not providers.configured(env,provider):
-            return {'provider':provider,'status':'not_configured','models':[]}
-        try:
-            models=await providers.catalog(env,provider)
-            return {'provider':provider,'status':'connected','models':models}
-        except Exception:
-            return {'provider':provider,'status':'unavailable','models':[]}
-    return await asyncio.gather(load('openai'),load('anthropic'))
+    d=db(req)
+    rows=await d.all("SELECT provider,enabled,cipher!='' AS configured FROM api_providers ORDER BY provider")
+    result=[{'provider':'demo','status':'connected','models':[{'id':demo.DEMO_ID,'name':'Demo (local, free)'}]}]
+    for r in rows:
+        models=await d.all("SELECT model_name AS id,label AS name FROM api_models WHERE provider=? AND enabled=1 ORDER BY label",r['provider'])
+        active=bool(r['enabled'] and r['configured'])
+        result.append({'provider':r['provider'],'status':'connected' if active else 'not_configured','models':models if active else []})
+    return result
 
 
 # Verified identity is not authorization. Only this narrow route accepts unapproved identities.
@@ -504,3 +536,89 @@ async def safety_update(req:Request,p:SafetyInput,u=Depends(current)):
     role(u,'admin')
     await write(db(req),u,'model.safety_toggle','global','UPDATE safety_settings SET enabled=? WHERE id=1',int(p.enabled))
     return {'enabled':p.enabled}
+
+
+# Shared provider registry, server-only credentials and model pricing.
+def price_micros(input_tokens,output_tokens,input_cents,output_cents):
+    return (input_tokens*input_cents+output_tokens*output_cents+99)//100
+
+async def registered_model(d,provider,name):
+    return await d.one("""SELECT p.cipher,p.revision AS provider_revision,m.revision AS model_revision,m.input_cents,m.output_cents
+      FROM api_providers p JOIN api_models m ON m.provider=p.provider
+      WHERE p.provider=? AND m.model_name=? AND p.enabled=1 AND m.enabled=1 AND p.cipher!=''""",provider,name)
+
+class ProviderConfig(BaseModel):
+    api_key: str | None = Field(default=None,min_length=8,max_length=500)
+    enabled: bool = Field(strict=True)
+    monthly_requests: int = Field(ge=1,le=1000,strict=True)
+    budget_cents: int = Field(ge=1,le=100000,strict=True)
+    remove_key: bool = Field(default=False,strict=True)
+
+class RegisteredModel(BaseModel):
+    provider: Literal['openai','anthropic']
+    model_name: str = Field(min_length=1,max_length=200,pattern=r'^[A-Za-z0-9._:/-]+$')
+    label: str = Field(min_length=1,max_length=200)
+    input_cents: int = Field(ge=1,le=100000,strict=True)
+    output_cents: int = Field(ge=1,le=100000,strict=True)
+    enabled: bool = Field(default=True,strict=True)
+
+class BudgetInput(BaseModel):
+    budget_cents: int = Field(ge=1,le=100000,strict=True)
+
+@app.get('/api/workspace/settings')
+async def registry_settings(req:Request,u=Depends(current)):
+    role(u,'admin');d=db(req)
+    providers_rows=await d.all("""SELECT p.provider,p.enabled,p.cipher!='' AS configured,p.monthly_requests,p.budget_micros,
+       (SELECT COUNT(*) FROM api_cost c WHERE c.provider=p.provider AND c.month=strftime('%Y-%m','now')) AS used_requests,
+       COALESCE((SELECT SUM(c.cost_micros) FROM api_cost c WHERE c.provider=p.provider AND c.month=strftime('%Y-%m','now')),0) AS used_micros FROM api_providers p ORDER BY p.provider""")
+    models=await d.all("""SELECT a.provider,a.model_name,a.label,a.input_cents,a.output_cents,a.enabled,
+       (SELECT COUNT(*) FROM models m WHERE m.provider=a.provider AND m.model_name=a.model_name) AS scenarios,
+       COALESCE((SELECT SUM(c.cost_micros) FROM api_cost c WHERE c.provider=a.provider AND c.model_name=a.model_name),0) AS cost_micros
+       FROM api_models a ORDER BY provider,label""")
+    total=await d.one("""SELECT COALESCE(SUM(cost_micros),0) AS total_micros,
+       COALESCE(SUM(CASE WHEN status='reported' THEN cost_micros ELSE 0 END),0) AS reported_micros,
+       COALESCE(SUM(CASE WHEN status!='reported' THEN cost_micros ELSE 0 END),0) AS estimated_micros,
+       COALESCE(SUM(CASE WHEN month=strftime('%Y-%m','now') THEN cost_micros ELSE 0 END),0) AS monthly_micros,
+       COUNT(*) AS requests FROM api_cost""")
+    budget=await d.one('SELECT budget_micros FROM api_budget WHERE id=1')
+    return {'providers':providers_rows,'models':models,'cost':total,'budget_micros':budget['budget_micros'],'vault_ready':bool(getattr(req.scope['brite_env'],'BRITE_VAULT_KEY',''))}
+
+@app.put('/api/workspace/settings/providers/{provider}')
+async def provider_update(req:Request,provider:Literal['openai','anthropic'],p:ProviderConfig,u=Depends(current)):
+    role(u,'admin');d=db(req);env=req.scope['brite_env']
+    if p.remove_key and p.api_key:fail(422,'Choose key replacement or removal, not both.')
+    old=await d.one('SELECT cipher FROM api_providers WHERE provider=?',provider)
+    cipher=old['cipher']
+    if p.remove_key:cipher=''
+    elif p.api_key:
+        if not p.api_key.strip() or p.api_key!=p.api_key.strip():fail(422,'Enter a valid API key without surrounding whitespace.')
+        try:cipher=await vault.seal(env,provider,p.api_key)
+        except Exception:fail(503,'Secure credential storage unavailable.')
+    if p.enabled and not cipher:fail(422,'Add an API key before enabling this provider.')
+    await write(d,u,'api.provider_update',provider,'UPDATE api_providers SET cipher=?,enabled=?,monthly_requests=?,budget_micros=?,revision=revision+1 WHERE provider=?',cipher,int(p.enabled and not p.remove_key),p.monthly_requests,p.budget_cents*10000,provider)
+    return {'ok':True}
+
+@app.get('/api/workspace/settings/discover/{provider}')
+async def registry_discover(req:Request,provider:Literal['openai','anthropic'],u=Depends(current)):
+    role(u,'admin');d=db(req);r=await d.one('SELECT cipher FROM api_providers WHERE provider=?',provider)
+    if not r['cipher']:fail(409,'Add an API key first.')
+    try:
+        key=await vault.unseal(req.scope['brite_env'],provider,r['cipher'])
+        env=SimpleNamespace(**{('OPENAI_API_KEY' if provider=='openai' else 'ANTHROPIC_API_KEY'):key})
+        return {'models':await providers.catalog(env,provider)}
+    except Exception:fail(503,'Provider discovery failed. Check key and model-list permission.')
+
+@app.put('/api/workspace/settings/models')
+async def model_register(req:Request,p:RegisteredModel,u=Depends(current)):
+    role(u,'admin');d=db(req)
+    if p.model_name==demo.DEMO_ID:fail(422,'Reserved demo model ID.')
+    if not p.label.strip():fail(422,'Enter a model label.')
+    if not await d.one("SELECT 1 FROM api_providers WHERE provider=? AND cipher!=''",p.provider):fail(409,'Add the provider API key first.')
+    await write(d,u,'api.model_register',p.provider+':'+p.model_name,"""INSERT INTO api_models(provider,model_name,label,input_cents,output_cents,enabled) VALUES(?,?,?,?,?,?)
+    ON CONFLICT(provider,model_name) DO UPDATE SET label=excluded.label,input_cents=excluded.input_cents,output_cents=excluded.output_cents,enabled=excluded.enabled,revision=revision+1""",p.provider,p.model_name,p.label.strip(),p.input_cents,p.output_cents,int(p.enabled))
+    return {'ok':True}
+
+@app.put('/api/workspace/settings/budget')
+async def budget_update(req:Request,p:BudgetInput,u=Depends(current)):
+    role(u,'admin');await write(db(req),u,'api.budget_update','global','UPDATE api_budget SET budget_micros=? WHERE id=1',p.budget_cents*10000)
+    return {'ok':True}

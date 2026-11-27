@@ -11,7 +11,7 @@ async def chunks(model,history,env):
         url='https://api.openai.com/v1/chat/completions'
         headers={'Authorization':f'Bearer {key}'}
         if system: messages.insert(0,{'role':'system','content':system})
-        body={'model':model['model_name'],'messages':messages,'stream':True,'max_completion_tokens':model['max_tokens']}
+        body={'model':model['model_name'],'messages':messages,'stream':True,'stream_options':{'include_usage':True},'max_completion_tokens':model['max_tokens']}
     elif provider=='anthropic':
         url='https://api.anthropic.com/v1/messages'
         headers={'x-api-key':str(key),'anthropic-version':'2023-06-01'}
@@ -29,6 +29,15 @@ async def chunks(model,history,env):
                 if raw=='[DONE]': done=True; break
                 event=json.loads(raw)
                 if event.get('error') or event.get('type')=='error': raise RuntimeError('Provider error')
+                usage=model.get('_usage')
+                if usage is not None:
+                    if provider=='openai' and isinstance(event.get('usage'),dict):
+                        reported=event['usage'];usage['input_tokens']=reported.get('prompt_tokens');usage['output_tokens']=reported.get('completion_tokens')
+                    elif provider=='anthropic':
+                        reported=event.get('message',{}).get('usage',{}) if event.get('type')=='message_start' else event.get('usage',{})
+                        if isinstance(reported,dict):
+                            if type(reported.get('input_tokens'))==int:usage['input_tokens']=reported['input_tokens']+int(reported.get('cache_creation_input_tokens') or 0)+int(reported.get('cache_read_input_tokens') or 0)
+                            if type(reported.get('output_tokens'))==int:usage['output_tokens']=reported['output_tokens']
                 if provider=='openai':
                     choices=event.get('choices') or []
                     if not choices: continue

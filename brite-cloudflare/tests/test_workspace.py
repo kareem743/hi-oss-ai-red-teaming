@@ -17,7 +17,7 @@ def test_scenario_workspace():
             assert (await a.post('/api/workspace/scenarios',json=data('Unapproved','private',['unknown@example.org']))).status_code==409
             await ok(a,'POST','/api/workspace/volunteers',json={'email':'one@example.org'})
             assert (await v.get('/api/workspace/model-catalog')).status_code==403
-            assert all(p['status']=='not_configured' for p in await ok(a,'GET','/api/workspace/model-catalog'))
+            assert all(p['status']=='not_configured' for p in await ok(a,'GET','/api/workspace/model-catalog') if p['provider']!='demo')
             assert (await a.post('/api/workspace/volunteers',headers={'Origin':'https://evil.example'},json={'email':'blocked@example.org'})).status_code==403
             private=await ok(a,'POST','/api/workspace/scenarios',json=data('Private','private',['one@example.org']))
             public=await ok(a,'POST','/api/workspace/scenarios',json=data('Public','public',[]))

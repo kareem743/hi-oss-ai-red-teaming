@@ -19,5 +19,9 @@
     "vite": "^7.0.0",
     "@playwright/test": "1.56.1",
     "miniflare": "^4.20251105.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5",
+    "undici": "7.30.2"
   }
 }

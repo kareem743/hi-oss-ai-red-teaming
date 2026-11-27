@@ -19,8 +19,8 @@ test('complete scenario workflow with isolated volunteer and flagged transcript'
  await a.locator('#vol-search').fill('volunteer@example.org');
  await a.locator('[data-volunteer="volunteer@example.org"]').check();
  await expect(a.locator('#selected-count')).toHaveText('1 selected');
- await expect(a.locator('#catalog-state')).toContainText('No provider key configured');
- await a.locator('#model-name').fill('gpt-test');
+ await expect(a.locator('#catalog-state')).toContainText('Local demo');
+ await expect(a.locator('#model-preset')).toHaveValue('brite-demo-local');
  await a.locator('#system-prompt').fill('Synthetic medical assistant');
  await expect(a.locator('#no-limit')).toBeChecked();
  await expect(a.locator('#max-turns')).toBeHidden();
@@ -85,4 +85,13 @@ test('verified applicant approval then blacklist in admin interface',async({brow
  await expect(a.locator('.access-row').filter({hasText:'new-ci@example.org'})).toContainText('blacklisted');
  await v.reload();await expect(v.getByRole('heading',{name:'Access blocked'})).toBeVisible();
  await Promise.all([ac.close(),vc.close()]);
+});
+
+test('admin settings and demo target are connected',async({browser})=>{
+ const {c,p}=await persona(browser,'admin@example.org');await p.goto(base);await p.getByRole('button',{name:'Settings',exact:true}).click();
+ await expect(p.getByRole('heading',{name:'API management'})).toBeVisible();
+ await expect(p.getByText('Total tracked API cost')).toBeVisible();
+ await p.locator('#api-budget-form input').fill('12.50');await p.getByRole('button',{name:'Save budget',exact:true}).click();
+ await expect(p.locator('#api-budget-form input')).toHaveValue('12.50');
+ await p.getByRole('button',{name:'Create scenario',exact:true}).click();await expect(p.locator('#model-preset')).toHaveValue('brite-demo-local');await c.close();
 });

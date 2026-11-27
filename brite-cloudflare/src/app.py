@@ -1,12 +1,19 @@
 import asyncio,csv,io,json,uuid,hashlib,time
 from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel,Field
 from .db import DB
 from . import providers, vault, demo
 from types import SimpleNamespace
 app=FastAPI(title='BRITE | Red Teaming',version='0.2.0',docs_url=None,redoc_url=None,openapi_url=None)
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(req:Request,exc:RequestValidationError):
+    if req.url.path.startswith('/api/workspace/settings/providers/'):
+        return JSONResponse({'detail':'Invalid provider configuration.'},status_code=422)
+    return JSONResponse({'detail':[{'loc':list(e['loc']),'msg':e['msg'],'type':e['type']} for e in exc.errors()]},status_code=422)
 
 def uid(): return str(uuid.uuid4())
 def fail(code,msg): raise HTTPException(code,msg)

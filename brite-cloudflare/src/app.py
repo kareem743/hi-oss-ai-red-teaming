@@ -22,7 +22,7 @@ def role(user,*roles):
 async def campaign(d,u,c):
     row=await d.one('SELECT * FROM campaigns WHERE id=?',c)
     if not row: fail(404,'Campaign not found.')
-    if u['role']!='admin' and not await d.one('SELECT 1 FROM memberships WHERE campaign_id=? AND email=?',c,u['email']): fail(404,'Campaign not found.')
+    if u['role']!='admin' and not (u['role']=='volunteer' and row.get('is_public',0)) and not await d.one('SELECT 1 FROM memberships WHERE campaign_id=? AND email=?',c,u['email']): fail(404,'Campaign not found.')
     return row
 async def conversation(d,u,c):
     row=await d.one('SELECT * FROM conversations WHERE id=?',c)
@@ -87,7 +87,7 @@ async def training(req:Request,p:TrainingInput,u=Depends(current)):
 async def campaigns(req:Request,u=Depends(current)):
     d=db(req)
     if u['role']=='admin': return await d.all('SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 200')
-    return await d.all('SELECT c.* FROM campaigns c JOIN memberships m ON c.id=m.campaign_id WHERE m.email=? ORDER BY c.created_at DESC LIMIT 200',u['email'])
+    return await d.all("SELECT c.* FROM campaigns c WHERE (EXISTS(SELECT 1 FROM memberships m WHERE m.campaign_id=c.id AND m.email=?) OR (?='volunteer' AND c.is_public=1)) AND (?!='volunteer' OR c.status='active') ORDER BY c.created_at DESC LIMIT 200",u['email'],u['role'],u['role'])
 @app.post('/api/campaigns',status_code=201)
 async def create_campaign(req:Request,p:CampaignInput,u=Depends(current)):
     role(u,'admin'); id=uid();await write(db(req),u,'campaign.create',id,'INSERT INTO campaigns(id,title,description) VALUES(?,?,?)',id,p.title,p.description);return {'id':id}
@@ -234,3 +234,118 @@ async def audit_log(req:Request,u=Depends(current)):
 
 async def reap(env):
     return await DB(env.DB).run("UPDATE turns SET status='failed',error='Interrupted response (timeout)' WHERE status='pending' AND created_at < datetime('now','-10 minutes')")
+
+
+# Scenario-first workspace. Campaigns remain the internal authorization boundary.
+from pydantic import BaseModel, Field
+from typing import Literal
+
+class WorkspaceScenario(BaseModel):
+    title: str = Field(min_length=1,max_length=200)
+    description: str = Field(min_length=1,max_length=12000)
+    audience: Literal['public','private']
+    emails: list[str] = Field(default_factory=list,max_length=100)
+    provider: Literal['openai','anthropic']
+    model_name: str = Field(min_length=1,max_length=200)
+    model_label: str = Field(min_length=1,max_length=200)
+
+class WorkspaceEmail(BaseModel):
+    email: str = Field(min_length=3,max_length=254)
+
+class WorkspaceFlag(BaseModel):
+    turn_id: str
+    reason: str = Field(default='',max_length=4000)
+
+def normalize_email(value):
+    import re
+    v=value.strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',v) or len(v)>254: fail(422,'Enter a valid email address.')
+    return v
+
+async def workspace_assignment(d,u,c,emails):
+    result=[]
+    for e in dict.fromkeys(normalize_email(x) for x in emails):
+        existing=await d.one('SELECT role,active FROM users WHERE email=?',e)
+        if existing and (existing['role']!='volunteer' or not existing['active']): fail(409,'An assigned email is not an active volunteer.')
+        result.extend([('INSERT OR IGNORE INTO users(email,role,active,trained) VALUES(?,\'volunteer\',1,0)',(e,)),('INSERT OR IGNORE INTO memberships(campaign_id,email) VALUES(?,?)',(c,e))])
+    return result
+
+@app.get('/api/workspace/scenarios')
+async def workspace_scenarios(req:Request,u=Depends(current)):
+    d=db(req)
+    sql="""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public,c.created_at,
+        (SELECT GROUP_CONCAT(m.label,', ') FROM models m WHERE m.campaign_id=c.id AND m.enabled=1) AS models,
+        (SELECT COUNT(*) FROM conversations v WHERE v.scenario_id=s.id) AS conversations,
+        (SELECT COUNT(DISTINCT v.id) FROM conversations v JOIN findings f ON f.conversation_id=v.id WHERE v.scenario_id=s.id) AS flagged,
+        (SELECT COUNT(*) FROM memberships m JOIN users a ON a.email=m.email WHERE m.campaign_id=c.id AND a.role='volunteer') AS assigned
+        FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id"""
+    if u['role']=='admin':
+        return await d.all(sql+' ORDER BY c.created_at DESC,s.id LIMIT 200')
+    if u['role']=='reviewer':
+        return await d.all(sql+" WHERE EXISTS(SELECT 1 FROM memberships m WHERE m.campaign_id=c.id AND m.email=?) ORDER BY c.created_at DESC,s.id LIMIT 200",u['email'])
+    # Never disclose other volunteers' counts, assignments, or evidence.
+    return await d.all("""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public,
+        (SELECT GROUP_CONCAT(m.label,', ') FROM models m WHERE m.campaign_id=c.id AND m.enabled=1) AS models,
+        (SELECT COUNT(*) FROM conversations v WHERE v.scenario_id=s.id AND v.owner=?) AS conversations
+        FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id WHERE c.status='active' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM memberships m WHERE m.campaign_id=c.id AND m.email=?))
+        ORDER BY c.created_at DESC,s.id LIMIT 200""",u['email'],u['email'])
+
+@app.post('/api/workspace/scenarios',status_code=201)
+async def workspace_create(req:Request,p:WorkspaceScenario,u=Depends(current)):
+    role(u,'admin');d=db(req)
+    if not p.title.strip() or not p.description.strip() or not p.model_name.strip() or not p.model_label.strip(): fail(422,'Complete all required fields.')
+    if p.audience=='private' and not p.emails: fail(422,'Assign at least one volunteer email.')
+    c,s,m=uid(),uid(),uid()
+    assignments=await workspace_assignment(d,u,c,p.emails)
+    await d.batch([
+        ("INSERT INTO campaigns(id,title,description,status,is_public) VALUES(?,?,?,'active',?)",(c,p.title.strip(),p.description.strip(),int(p.audience=='public'))),
+        ('INSERT INTO scenarios(id,campaign_id,title,instructions) VALUES(?,?,?,?)',(s,c,p.title.strip(),p.description.strip())),
+        ('INSERT INTO models(id,campaign_id,label,provider,model_name) VALUES(?,?,?,?,?)',(m,c,p.model_label.strip(),p.provider,p.model_name.strip())),
+        *assignments,audit(u,'scenario.create',s)
+    ])
+    return {'id':s,'campaign_id':c}
+
+async def workspace_scenario(d,u,s):
+    row=await d.one('SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id WHERE s.id=?',s)
+    if not row: fail(404,'Scenario not found.')
+    await campaign(d,u,row['campaign_id'])
+    return row
+
+@app.get('/api/workspace/scenarios/{s}')
+async def workspace_detail(req:Request,s:str,u=Depends(current)):
+    d=db(req);row=await workspace_scenario(d,u,s);c=row['campaign_id']
+    row['model_options']=await d.all('SELECT id,label,provider,model_name FROM models WHERE campaign_id=? AND enabled=1 ORDER BY label',c)
+    args=[s];where=''
+    if u['role']=='volunteer': where=' AND v.owner=?';args.append(u['email'])
+    row['sessions']=await d.all("""SELECT v.id,v.owner,v.state,v.created_at,m.label AS model,
+        (SELECT COUNT(*) FROM turns t WHERE t.conversation_id=v.id) AS turns,
+        (SELECT COUNT(*) FROM findings f WHERE f.conversation_id=v.id) AS flags
+        FROM conversations v JOIN models m ON m.id=v.model_id WHERE v.scenario_id=?"""+where+' ORDER BY v.created_at DESC LIMIT 500',*args)
+    if u['role']!='volunteer':
+        row['emails']=await d.all("SELECT a.email FROM memberships m JOIN users a ON a.email=m.email WHERE m.campaign_id=? AND a.role='volunteer' ORDER BY a.email",c)
+    return row
+
+@app.post('/api/workspace/scenarios/{s}/assign')
+async def workspace_assign(req:Request,s:str,p:WorkspaceEmail,u=Depends(current)):
+    role(u,'admin');d=db(req);row=await workspace_scenario(d,u,s)
+    await d.batch([*await workspace_assignment(d,u,row['campaign_id'],[p.email]),audit(u,'scenario.assign',s)])
+    return {'ok':True}
+
+@app.post('/api/workspace/volunteers')
+async def workspace_add_volunteer(req:Request,p:WorkspaceEmail,u=Depends(current)):
+    role(u,'admin');d=db(req);e=normalize_email(p.email)
+    existing=await d.one('SELECT role,active FROM users WHERE email=?',e)
+    if existing and (existing['role']!='volunteer' or not existing['active']): fail(409,'Email belongs to a different or inactive account.')
+    await d.batch([("INSERT OR IGNORE INTO users(email,role,active,trained) VALUES(?,'volunteer',1,0)",(e,)),audit(u,'volunteer.approve',e)])
+    return {'ok':True}
+
+@app.post('/api/workspace/conversations/{c}/flag')
+async def workspace_flag(req:Request,c:str,p:WorkspaceFlag,u=Depends(current)):
+    role(u,'volunteer');d=db(req);v=await conversation(d,u,c)
+    turn=await d.one('SELECT id FROM turns WHERE id=? AND conversation_id=? AND status=\'complete\'',p.turn_id,c)
+    if not turn: fail(404,'Response not found.')
+    existing=await d.one('SELECT id FROM findings WHERE conversation_id=? AND turn_id=? AND author=?',c,p.turn_id,u['email'])
+    if existing: return {'id':existing['id']}
+    id=uid()
+    await d.batch([("INSERT INTO findings(id,conversation_id,turn_id,author,category,severity,explanation,expected) SELECT ?,?,?,?,'other','moderate',?,'' WHERE NOT EXISTS(SELECT 1 FROM findings WHERE conversation_id=? AND turn_id=? AND author=?)",(id,c,p.turn_id,u['email'],p.reason.strip() or 'Flagged for reviewer attention.',c,p.turn_id,u['email'])),audit(u,'response.flag',id)])
+    return {'ok':True}

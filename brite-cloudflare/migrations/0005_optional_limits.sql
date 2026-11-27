@@ -1,0 +1,1 @@
+ALTER TABLE scenarios ADD COLUMN no_limit INTEGER NOT NULL DEFAULT 0 CHECK(no_limit IN (0,1));

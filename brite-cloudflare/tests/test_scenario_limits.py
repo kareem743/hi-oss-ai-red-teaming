@@ -36,6 +36,14 @@ def test_scenario_limits_enforced_before_billing():
       assert (await send(c,'x')).status_code==409
       assert d.conn.execute('SELECT requests FROM model_daily_usage').fetchone()[0]==2
       assert len(chat['turns'])==1
+      unlimited,c=await create(no_limit=True,max_turns=1,max_context_chars=1000)
+      assert unlimited['no_limit']==1
+      assert (await send(c,'x'*1500)).status_code==200
+      assert (await send(c,'another question')).status_code==200
+      chat=(await v.get('/api/conversations/'+c)).json()
+      assert chat['limits']['no_limit'] is True and chat['limits']['turns_remaining'] is None and chat['limits']['context_chars_remaining'] is None
+      d.conn.execute("UPDATE model_daily_usage SET requests=50");d.conn.commit()
+      assert (await send(c,'daily cap')).status_code==429
       # A failed reserved attempt also counts toward the turn cap.
       _,c=await create(max_turns=1,max_context_chars=2000)
       d.conn.execute("INSERT INTO turns(id,conversation_id,seq,prompt,status) VALUES('failed-test',?,1,'failed','failed')",(c,));d.conn.commit()

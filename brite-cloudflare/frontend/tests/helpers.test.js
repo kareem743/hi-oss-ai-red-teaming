@@ -42,3 +42,5 @@ test('conversation allowance stops at either limit and caps the next prompt',()=
  assert.equal(conversationAllowance({turns_remaining:2,context_chars_remaining:20000}).maxPrompt,8000);
  assert.equal(conversationAllowance(null).blocked,true);
 });
+
+test('no limit allows sending without scenario counters',()=>{assert.deepEqual(conversationAllowance({no_limit:true,turns_remaining:null,context_chars_remaining:null}),{blocked:false,reason:'',maxPrompt:8000});});

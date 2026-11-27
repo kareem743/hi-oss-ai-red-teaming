@@ -31,6 +31,7 @@ export class SSEParser {
 
 export function conversationAllowance(l){
  if(!l)return {blocked:true,reason:'Conversation limits unavailable. Reload to continue.',maxPrompt:0};
+ if(l.no_limit)return {blocked:false,reason:'',maxPrompt:8000};
  if(l.turns_remaining<=0)return {blocked:true,reason:'Conversation turn limit reached.',maxPrompt:0};
  if(l.context_chars_remaining<=0)return {blocked:true,reason:'Conversation context limit reached.',maxPrompt:0};
  return {blocked:false,reason:'',maxPrompt:Math.min(8000,l.context_chars_remaining)};

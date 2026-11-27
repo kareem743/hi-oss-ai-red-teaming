@@ -12,6 +12,11 @@ test('actual local D1 binding: migrations, parameter binding, rollback, constrai
   const statements=sql.split(';').map(x=>x.trim()).filter(x=>x&&!x.startsWith('PRAGMA foreign_keys'));
   await db.batch(statements.map(x=>db.prepare(x)));
  }
+ await db.prepare("INSERT INTO campaigns(id,title,description) VALUES('limits','Test','Test')").run();
+ await db.prepare("INSERT INTO scenarios(id,campaign_id,title,instructions) VALUES('s','limits','Test','Test')").run();
+ const limits=await db.prepare("SELECT max_turns,max_context_chars FROM scenarios WHERE id='s'").first();
+ assert.equal(limits.max_turns,25);assert.equal(limits.max_context_chars,80000);
+ await assert.rejects(()=>db.prepare("UPDATE scenarios SET max_turns=26 WHERE id='s'").run());
  await db.prepare("INSERT INTO users(email,role) VALUES(?,?)").bind('ci@example.org','volunteer').run();
  assert.equal((await db.prepare('SELECT role FROM users WHERE email=?').bind('ci@example.org').first()).role,'volunteer');
  assert.equal(await db.prepare('SELECT email FROM users WHERE email=?').bind("' OR 1=1 --").first(),null);

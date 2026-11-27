@@ -12,8 +12,10 @@ def test_fresh_and_incremental_migrations():
     assert len(files)>=3
     c.executescript(files[0].read_text())
     c.execute("INSERT INTO campaigns(id,title,description) VALUES('old','Old','Original')")
+    c.execute("INSERT INTO scenarios(id,campaign_id,title,instructions) VALUES('old-s','old','Old scenario','Instructions')")
     for f in files[1:]:c.executescript(f.read_text())
     assert c.execute("SELECT title,is_public FROM campaigns WHERE id='old'").fetchone()==('Old',0)
+    assert c.execute("SELECT max_turns,max_context_chars FROM scenarios WHERE id='old-s'").fetchone()==(25,80000)
     assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
     assert not c.execute('PRAGMA foreign_key_check').fetchall()
 
@@ -35,6 +37,9 @@ def d():
  "INSERT INTO memberships(campaign_id,email) VALUES('missing','a@example.org')",
  "INSERT INTO models(id,campaign_id,label,provider,model_name) VALUES('x','c','M','unknown','x')",
  "UPDATE campaigns SET is_public=2 WHERE id='c'",
+ "UPDATE scenarios SET max_turns=0 WHERE id='s'",
+ "UPDATE scenarios SET max_turns=26 WHERE id='s'",
+ "UPDATE scenarios SET max_context_chars=80001 WHERE id='s'",
  "INSERT INTO model_daily_usage(email,day,requests) VALUES('a@example.org','2026-01-01',-1)",
  "INSERT INTO turns(id,conversation_id,seq,prompt,status) VALUES('x','missing',1,'test','pending')",
 ])

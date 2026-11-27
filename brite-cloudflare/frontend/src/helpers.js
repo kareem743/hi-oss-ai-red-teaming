@@ -28,3 +28,10 @@ export class SSEParser {
  }}
  finish(){this.buffer+=this.decoder.decode();this.drain();if(!this.done||this.buffer.trim())throw Error('Response interrupted. Refresh to inspect the saved conversation.');}
 }
+
+export function conversationAllowance(l){
+ if(!l)return {blocked:true,reason:'Conversation limits unavailable. Reload to continue.',maxPrompt:0};
+ if(l.turns_remaining<=0)return {blocked:true,reason:'Conversation turn limit reached.',maxPrompt:0};
+ if(l.context_chars_remaining<=0)return {blocked:true,reason:'Conversation context limit reached.',maxPrompt:0};
+ return {blocked:false,reason:'',maxPrompt:Math.min(8000,l.context_chars_remaining)};
+}

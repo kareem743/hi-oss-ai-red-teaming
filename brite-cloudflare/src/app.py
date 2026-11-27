@@ -140,10 +140,21 @@ async def start(req:Request,c:str,p:ConversationInput,u=Depends(current)):
     s=await d.one('SELECT id FROM scenarios WHERE id=? AND campaign_id=?',p.scenario_id,c);m=await d.one('SELECT * FROM models WHERE id=? AND campaign_id=? AND enabled=1',p.model_id,c)
     if not s or not m:fail(422,'Choose a scenario and model from this campaign.')
     id=uid();await write(d,u,'conversation.create',id,'INSERT INTO conversations(id,campaign_id,scenario_id,model_id,owner,model_snapshot) VALUES(?,?,?,?,?,?)',id,c,p.scenario_id,p.model_id,u['email'],json.dumps(m));return {'id':id}
+async def conversation_limits(d,row,turns,model):
+    scenario=await d.one('SELECT max_turns,max_context_chars FROM scenarios WHERE id=?',row['scenario_id'])
+    if not scenario: fail(404,'Scenario not found.')
+    # Count all reserved attempts, even failed ones, to prevent repeated billed retries.
+    # Context is the actual text included in the next provider request, excluding protocol framing.
+    chars=len(model.get('system_prompt') or '')+sum(len(t['prompt'])+len(t['response']) for t in turns if t['status']=='complete')
+    maximum=scenario['max_context_chars']
+    return {'max_turns':scenario['max_turns'],'turns_used':len(turns),'turns_remaining':max(0,scenario['max_turns']-len(turns)),
+            'max_context_chars':maximum,'context_chars_used':chars,'context_chars_remaining':max(0,maximum-chars)}
+
 @app.get('/api/conversations/{c}')
 async def read_conversation(req:Request,c:str,u=Depends(current)):
-    d=db(req);row=await conversation(d,u,c);row.pop('model_snapshot',None)
+    d=db(req);row=await conversation(d,u,c);model=json.loads(row.pop('model_snapshot'))
     row['turns']=await d.all('SELECT * FROM turns WHERE conversation_id=? ORDER BY seq',c)
+    row['limits']=await conversation_limits(d,row,row['turns'],model)
     row['tasks']=await d.all('SELECT t.*, CASE WHEN x.task_id IS NULL THEN 0 ELSE 1 END AS completed FROM tasks t LEFT JOIN completions x ON x.task_id=t.id AND x.conversation_id=? WHERE t.scenario_id=?',c,row['scenario_id'])
     row['findings']=await d.all('SELECT f.*,r.verdict,r.feedback FROM findings f LEFT JOIN reviews r ON r.finding_id=f.id WHERE f.conversation_id=? ORDER BY f.created_at',c)
     return row
@@ -152,13 +163,14 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     d=db(req);row=await own_open(d,u,c);model=json.loads(row['model_snapshot']);env=req.scope['brite_env']
     if not getattr(env,'OPENAI_API_KEY' if model['provider']=='openai' else 'ANTHROPIC_API_KEY','') and not req.scope.get('brite_test_provider'):fail(503,'AI provider is not configured.')
     rows=await d.all('SELECT seq,prompt,response,status FROM turns WHERE conversation_id=? ORDER BY seq',c)
-    if len(rows)>=25:fail(409,'Pilot limit: 25 turns per conversation.')
+    limits=await conversation_limits(d,row,rows,model)
+    if limits['turns_remaining']==0:fail(409,f"Conversation turn limit reached ({limits['max_turns']}).")
     if any(r['status']=='pending' for r in rows):fail(409,'A response is already in progress.')
     history=[]
     for r in rows:
         if r['status']=='complete':history.extend([{'role':'user','content':r['prompt']},{'role':'assistant','content':r['response']}])
     history.append({'role':'user','content':p.prompt})
-    if sum(len(x['content']) for x in history)>80000: fail(409,'Conversation context limit reached. Start a new chat.')
+    if len(p.prompt)>limits['context_chars_remaining']: fail(409,f"Conversation context limit reached ({limits['max_context_chars']} characters). Shorten the message or finish the chat.")
     allowance=await d.one("INSERT INTO model_daily_usage(email,day,requests) VALUES(?,date('now'),1) ON CONFLICT(email,day) DO UPDATE SET requests=requests+1 WHERE requests<50 RETURNING requests",u['email'])
     if not allowance: fail(429,'Daily limit of 50 model requests reached.')
     id=uid();seq=rows[-1]['seq']+1 if rows else 1
@@ -254,6 +266,8 @@ class WorkspaceScenario(BaseModel):
     provider: Literal['openai','anthropic']
     model_name: str = Field(min_length=1,max_length=200)
     model_label: str = Field(min_length=1,max_length=200)
+    max_turns: int | None = Field(default=None,ge=1,le=25,strict=True)
+    max_context_chars: int | None = Field(default=None,ge=1000,le=80000,strict=True)
 
 class WorkspaceEmail(BaseModel):
     email: str = Field(min_length=3,max_length=254)
@@ -279,7 +293,7 @@ async def workspace_assignment(d,u,c,emails):
 @app.get('/api/workspace/scenarios')
 async def workspace_scenarios(req:Request,u=Depends(current)):
     d=db(req)
-    sql="""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public,c.created_at,
+    sql="""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,s.max_turns,s.max_context_chars,c.status,c.is_public,c.created_at,
         (SELECT GROUP_CONCAT(m.label,', ') FROM models m WHERE m.campaign_id=c.id AND m.enabled=1) AS models,
         (SELECT COUNT(*) FROM conversations v WHERE v.scenario_id=s.id) AS conversations,
         (SELECT COUNT(DISTINCT v.id) FROM conversations v JOIN findings f ON f.conversation_id=v.id WHERE v.scenario_id=s.id) AS flagged,
@@ -290,7 +304,7 @@ async def workspace_scenarios(req:Request,u=Depends(current)):
     if u['role']=='reviewer':
         return await d.all(sql+" WHERE EXISTS(SELECT 1 FROM memberships m WHERE m.campaign_id=c.id AND m.email=?) ORDER BY c.created_at DESC,s.id LIMIT 200",u['email'])
     # Never disclose other volunteers' counts, assignments, or evidence.
-    return await d.all("""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public,
+    return await d.all("""SELECT s.id,s.campaign_id,s.title,s.instructions AS description,s.max_turns,s.max_context_chars,c.status,c.is_public,
         (SELECT GROUP_CONCAT(m.label,', ') FROM models m WHERE m.campaign_id=c.id AND m.enabled=1) AS models,
         (SELECT COUNT(*) FROM conversations v WHERE v.scenario_id=s.id AND v.owner=?) AS conversations
         FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id WHERE c.status='active' AND (c.is_public=1 OR EXISTS(SELECT 1 FROM memberships m WHERE m.campaign_id=c.id AND m.email=?))
@@ -305,14 +319,14 @@ async def workspace_create(req:Request,p:WorkspaceScenario,u=Depends(current)):
     assignments=await workspace_assignment(d,u,c,p.emails)
     await d.batch([
         ("INSERT INTO campaigns(id,title,description,status,is_public) VALUES(?,?,?,'active',?)",(c,p.title.strip(),p.description.strip(),int(p.audience=='public'))),
-        ('INSERT INTO scenarios(id,campaign_id,title,instructions) VALUES(?,?,?,?)',(s,c,p.title.strip(),p.description.strip())),
+        ('INSERT INTO scenarios(id,campaign_id,title,instructions,max_turns,max_context_chars) VALUES(?,?,?,?,?,?)',(s,c,p.title.strip(),p.description.strip(),p.max_turns if p.max_turns is not None else 25,p.max_context_chars if p.max_context_chars is not None else 80000)),
         ('INSERT INTO models(id,campaign_id,label,provider,model_name) VALUES(?,?,?,?,?)',(m,c,p.model_label.strip(),p.provider,p.model_name.strip())),
         *assignments,audit(u,'scenario.create',s)
     ])
     return {'id':s,'campaign_id':c}
 
 async def workspace_scenario(d,u,s):
-    row=await d.one('SELECT s.id,s.campaign_id,s.title,s.instructions AS description,c.status,c.is_public FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id WHERE s.id=?',s)
+    row=await d.one('SELECT s.id,s.campaign_id,s.title,s.instructions AS description,s.max_turns,s.max_context_chars,c.status,c.is_public FROM scenarios s JOIN campaigns c ON c.id=s.campaign_id WHERE s.id=?',s)
     if not row: fail(404,'Scenario not found.')
     await campaign(d,u,row['campaign_id'])
     return row

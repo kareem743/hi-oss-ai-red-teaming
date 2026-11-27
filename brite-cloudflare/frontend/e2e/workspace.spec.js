@@ -21,6 +21,8 @@ test('complete scenario workflow with isolated volunteer and flagged transcript'
  await expect(a.locator('#selected-count')).toHaveText('1 selected');
  await expect(a.locator('#catalog-state')).toContainText('No provider key configured');
  await a.locator('#model-name').fill('gpt-test');
+ await a.locator('#max-turns').selectOption('1');
+ await a.locator('#max-context').selectOption('2000');
  await a.getByRole('button',{name:/Create & publish/}).click();
  await expect(a.getByRole('heading',{name:'CI private scenario',exact:true})).toBeVisible();
  await expect(a.locator('.instructions')).toContainText('<img src=x onerror=alert(1)>');
@@ -36,6 +38,9 @@ test('complete scenario workflow with isolated volunteer and flagged transcript'
  await v.locator('#synthetic').check();
  await v.getByRole('button',{name:'Send message'}).click();
  await expect(v.locator('.message.assistant')).toContainText('Synthetic demo response.');
+ await expect(v.getByText('Conversation turn limit reached.',{exact:true})).toBeVisible();
+ await expect(v.getByRole('button',{name:'Send message'})).toHaveCount(0);
+ await expect(v.getByRole('button',{name:'Finish chat'})).toBeVisible();
  await v.getByRole('button',{name:'Flag response',exact:true}).click();
  await v.locator('dialog textarea').fill('Potentially concerning example');
  await v.locator('dialog').getByRole('button',{name:'Flag response',exact:true}).click();

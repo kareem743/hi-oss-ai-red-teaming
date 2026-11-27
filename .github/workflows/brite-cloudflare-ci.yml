@@ -81,7 +81,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: cd brite-cloudflare && python -m pip install -e . pip-audit && python -m pip_audit --strict
+      - run: cd brite-cloudflare && python -m pip install -e . pip-audit && python -m pip uninstall -y brite-redteam-cloudflare && python -m pip_audit --strict
       - run: cd brite-cloudflare/frontend && npm install --no-audit --no-fund && npm audit --audit-level=high
   worker-package:
     needs: [backend, frontend, database, browser, dependency-security]

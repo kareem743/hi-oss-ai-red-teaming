@@ -20,7 +20,7 @@ async def chunks(model,history,env):
     else: raise RuntimeError('Unknown provider')
     headers['Content-Type']='application/json'
     done=False
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90,connect=15)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90,connect=15),follow_redirects=False) as client:
         async with client.stream('POST',url,headers=headers,json=body) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():

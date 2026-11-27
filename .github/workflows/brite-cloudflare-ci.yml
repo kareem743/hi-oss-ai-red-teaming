@@ -70,8 +70,21 @@ jobs:
           name: browser-report
           path: brite-cloudflare/frontend/playwright-report/
           retention-days: 7
+  dependency-security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cd brite-cloudflare && python -m pip install -e . pip-audit && python -m pip_audit --strict
+      - run: cd brite-cloudflare/frontend && npm install --no-audit --no-fund && npm audit --audit-level=high
   worker-package:
-    needs: [backend, frontend, database, browser]
+    needs: [backend, frontend, database, browser, dependency-security]
     timeout-minutes: 15
     runs-on: ubuntu-latest
     defaults:
@@ -113,7 +126,7 @@ jobs:
   quality-gate:
     runs-on: ubuntu-latest
     if: always()
-    needs: [backend, frontend, database, browser, worker-package]
+    needs: [backend, frontend, database, browser, dependency-security, worker-package]
     steps:
       - name: Reject failed or skipped required checks
         env:

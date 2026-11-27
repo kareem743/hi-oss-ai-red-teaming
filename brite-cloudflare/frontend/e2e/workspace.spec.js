@@ -70,3 +70,18 @@ test('unapproved and unauthenticated browser see no research navigation',async({
    await c.close();
  }
 });
+
+test('verified applicant approval then blacklist in admin interface',async({browser})=>{
+ const {c:vc,p:v}=await persona(browser,'new-ci@example.org');
+ await v.goto(base);await expect(v.getByRole('heading',{name:'Access request submitted'})).toBeVisible();
+ const {c:ac,p:a}=await persona(browser,'admin@example.org');await a.goto(base);await a.getByRole('button',{name:'Volunteers',exact:true}).click();
+ const row=a.locator('.access-row').filter({hasText:'new-ci@example.org'});
+ await row.getByRole('button',{name:'Approve',exact:true}).click();
+ await expect(a.getByRole('cell',{name:'new-ci@example.org'})).toBeVisible();
+ await v.reload();await expect(v.getByRole('heading',{name:'My scenarios',exact:true})).toBeVisible();
+ a.on('dialog',d=>d.accept());
+ await a.getByRole('row').filter({hasText:'new-ci@example.org'}).getByRole('button',{name:'Blacklist'}).click();
+ await expect(a.locator('.access-row').filter({hasText:'new-ci@example.org'})).toContainText('blacklisted');
+ await v.reload();await expect(v.getByRole('heading',{name:'Access blocked'})).toBeVisible();
+ await Promise.all([ac.close(),vc.close()]);
+});

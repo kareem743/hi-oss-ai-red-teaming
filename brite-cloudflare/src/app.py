@@ -51,8 +51,8 @@ async def security(req:Request,call_next):
         # Bound actual bytes, even when Content-Length is absent.
         received=bytearray()
         async for chunk in req.stream():
+            if len(received)+len(chunk)>128000:return Response('Request too large',413)
             received.extend(chunk)
-            if len(received)>128000:return Response('Request too large',413)
         req._body=bytes(received)
     res=await call_next(req); res.headers['Cache-Control']='no-store';res.headers['X-Content-Type-Options']='nosniff';return res
 
@@ -78,7 +78,7 @@ class ReviewInput(BaseModel):
 class TrainingInput(BaseModel): synthetic_only:Literal[True]; evidence_rule:Literal[True]; urgent_rule:Literal[True]
 
 @app.get('/api/health')
-async def health(): return {'ok':True}
+async def health(u=Depends(current)): return {'ok':True}
 @app.get('/api/me')
 async def me(u=Depends(current)): return u
 @app.get('/api/users')
@@ -185,6 +185,8 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     ip=req.headers.get('CF-Connecting-IP','unknown')
     ip_key=hashlib.sha256(('brite-ip-v1:'+ip).encode()).hexdigest()
     size=limits['context_chars_used']+len(p.prompt)
+    input_bytes=len((model.get('system_prompt') or '').encode('utf-8'))+sum(len(x['content'].encode('utf-8')) for x in history)
+    if input_bytes>320000:fail(409,'Platform context safety limit reached.')
     try:
         await d.batch([
           ("""INSERT INTO turns(id,conversation_id,seq,prompt,status)
@@ -195,15 +197,17 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
           AND COALESCE((SELECT requests FROM abuse_windows WHERE kind='user' AND subject=? AND window=?),0)<5
           AND COALESCE((SELECT requests FROM abuse_windows WHERE kind='ip' AND subject=? AND window=?),0)<20
           AND COALESCE((SELECT requests FROM model_monthly_usage WHERE month=?),0)<1000
-          AND NOT EXISTS(SELECT 1 FROM turns t JOIN conversations v ON v.id=t.conversation_id WHERE v.owner=? AND t.status='pending')""",(id,c,seq,p.prompt,u['email'],u['email'],u['email'],day,u['email'],minute,ip_key,minute,month,u['email'])),
+          AND COALESCE((SELECT reserved_input_bytes FROM model_monthly_usage WHERE month=?),0)+?<=2000000
+          AND COALESCE((SELECT output_token_allowance FROM model_monthly_usage WHERE month=?),0)+?<=512000
+          AND NOT EXISTS(SELECT 1 FROM turns t JOIN conversations v ON v.id=t.conversation_id WHERE v.owner=? AND t.status='pending')""",(id,c,seq,p.prompt,u['email'],u['email'],u['email'],day,u['email'],minute,ip_key,minute,month,month,input_bytes,month,model['max_tokens'],u['email'])),
           ("""INSERT INTO model_daily_usage(email,day,requests) SELECT ?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
             ON CONFLICT(email,day) DO UPDATE SET requests=requests+1""",(u['email'],day,id)),
           ("""INSERT INTO abuse_windows(kind,subject,window,requests) SELECT 'user',?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
             ON CONFLICT(kind,subject,window) DO UPDATE SET requests=requests+1""",(u['email'],minute,id)),
           ("""INSERT INTO abuse_windows(kind,subject,window,requests) SELECT 'ip',?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
             ON CONFLICT(kind,subject,window) DO UPDATE SET requests=requests+1""",(ip_key,minute,id)),
-          ("""INSERT INTO model_monthly_usage(month,requests,input_chars,output_token_allowance) SELECT ?,1,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
-            ON CONFLICT(month) DO UPDATE SET requests=requests+1,input_chars=input_chars+excluded.input_chars,output_token_allowance=output_token_allowance+excluded.output_token_allowance""",(month,size,model['max_tokens'],id)),
+          ("""INSERT INTO model_monthly_usage(month,requests,input_chars,output_token_allowance,reserved_input_bytes) SELECT ?,1,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
+            ON CONFLICT(month) DO UPDATE SET requests=requests+1,input_chars=input_chars+excluded.input_chars,output_token_allowance=output_token_allowance+excluded.output_token_allowance,reserved_input_bytes=reserved_input_bytes+excluded.reserved_input_bytes""",(month,size,model['max_tokens'],input_bytes,id)),
           ("""INSERT INTO model_usage(turn_id,email,scenario_id,model_id,input_chars,output_token_allowance) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)""",(id,u['email'],row['scenario_id'],row['model_id'],size,model['max_tokens'],id))
         ])
     except Exception:fail(409,'Unable to reserve turn; refresh and retry.')
@@ -284,7 +288,10 @@ async def audit_log(req:Request,u=Depends(current)):
     role(u,'admin');return await db(req).all('SELECT * FROM audit ORDER BY created_at DESC LIMIT 500')
 
 async def reap(env):
-    return await DB(env.DB).run("UPDATE turns SET status='failed',error='Interrupted response (timeout)' WHERE status='pending' AND created_at < datetime('now','-10 minutes')")
+    d=DB(env.DB)
+    result=await d.run("UPDATE turns SET status='failed',error='Interrupted response (timeout)' WHERE status='pending' AND created_at < datetime('now','-10 minutes')")
+    await d.run('DELETE FROM abuse_windows WHERE CAST(window AS INTEGER)<?',int(time.time())//60-1440)
+    return result
 
 
 # Scenario-first workspace. Campaigns remain the internal authorization boundary.
@@ -369,7 +376,8 @@ async def workspace_scenario(d,u,s):
 @app.get('/api/workspace/scenarios/{s}')
 async def workspace_detail(req:Request,s:str,u=Depends(current)):
     d=db(req);row=await workspace_scenario(d,u,s);c=row['campaign_id']
-    row['model_options']=await d.all('SELECT id,label,provider,model_name FROM models WHERE campaign_id=? AND enabled=1 ORDER BY label',c)
+    cols='id,label,provider,model_name,system_prompt' if u['role']=='admin' else 'id,label,provider,model_name'
+    row['model_options']=await d.all('SELECT '+cols+' FROM models WHERE campaign_id=? AND enabled=1 ORDER BY label',c)
     args=[s];where=''
     if u['role']=='volunteer': where=' AND v.owner=?';args.append(u['email'])
     row['sessions']=await d.all("""SELECT v.id,v.owner,v.state,v.created_at,m.label AS model,
@@ -489,7 +497,7 @@ async def safety_status(req:Request,u=Depends(current)):
     role(u,'admin');d=db(req)
     settings=await d.one('SELECT enabled FROM safety_settings WHERE id=1')
     usage=await d.one("SELECT * FROM model_monthly_usage WHERE month=strftime('%Y-%m','now')")
-    return {'enabled':bool(settings['enabled']),'monthly_requests':usage['requests'] if usage else 0,'monthly_request_limit':1000,'input_chars':usage['input_chars'] if usage else 0,'reserved_output_tokens':usage['output_token_allowance'] if usage else 0}
+    return {'enabled':bool(settings['enabled']),'monthly_requests':usage['requests'] if usage else 0,'monthly_request_limit':1000,'input_chars':usage['input_chars'] if usage else 0,'reserved_output_tokens':usage['output_token_allowance'] if usage else 0,'reserved_input_bytes':usage['reserved_input_bytes'] if usage else 0,'monthly_input_byte_limit':2000000,'monthly_output_token_limit':512000}
 
 @app.put('/api/workspace/safety')
 async def safety_update(req:Request,p:SafetyInput,u=Depends(current)):

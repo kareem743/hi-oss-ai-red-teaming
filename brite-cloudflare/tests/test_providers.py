@@ -19,6 +19,7 @@ def test_stream_provider_contract(monkeypatch,provider,endpoint,events):
         assert str(req.url)==endpoint
         body=json.loads(req.content)
         assert body['stream'] is True and body['model']=='gpt-test'
+        assert 'tools' not in body and 'functions' not in body and 'tool_choice' not in body
         if provider=='openai':
             assert req.headers['authorization']=='Bearer fake-openai'
             assert body['messages'][0]['role']=='system'

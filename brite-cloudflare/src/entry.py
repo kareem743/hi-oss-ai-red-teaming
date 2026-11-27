@@ -11,5 +11,5 @@ class Default(WorkerEntrypoint):
             scope['brite_env']=env;scope['brite_email']=email
             await app(scope,receive,send)
         return await asgi.fetch(scoped,request,env)
-    async def scheduled(self,controller):
+    async def scheduled(self,controller,env,ctx):
         await reap(self.env)

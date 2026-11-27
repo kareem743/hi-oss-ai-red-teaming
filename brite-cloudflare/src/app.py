@@ -1,4 +1,4 @@
-import asyncio,csv,io,json,uuid
+import asyncio,csv,io,json,uuid,hashlib,time
 from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
@@ -14,7 +14,7 @@ async def current(req:Request):
     email=req.scope.get('brite_email')
     if not email: fail(401,'Sign in through Cloudflare Access.')
     user=await db(req).one('SELECT email,role,trained FROM users WHERE email=? AND active=1',email.lower())
-    if not user: fail(403,'Your account has not been approved.')
+    if not user or await db(req).one("SELECT 1 FROM volunteer_access WHERE email=? AND status IN ('pending','rejected','removed','blacklisted')",email.lower()): fail(403,'Your account has not been approved.')
     return user
 
 def role(user,*roles):
@@ -48,6 +48,12 @@ async def security(req:Request,call_next):
         if req.headers.get('sec-fetch-site') in ('cross-site','same-site'): return Response('Origin not allowed',403)
         length=req.headers.get('content-length')
         if length and (not length.isdigit() or int(length)>128000): return Response('Request too large',413)
+        # Bound actual bytes, even when Content-Length is absent.
+        received=bytearray()
+        async for chunk in req.stream():
+            received.extend(chunk)
+            if len(received)>128000:return Response('Request too large',413)
+        req._body=bytes(received)
     res=await call_next(req); res.headers['Cache-Control']='no-store';res.headers['X-Content-Type-Options']='nosniff';return res
 
 class UserInput(BaseModel):
@@ -81,6 +87,7 @@ async def users(req:Request,u=Depends(current)):
 @app.put('/api/users')
 async def put_user(req:Request,p:UserInput,u=Depends(current)):
     role(u,'admin'); email=p.email.lower()
+    if await db(req).one("SELECT 1 FROM volunteer_access WHERE email=? AND status IN ('pending','rejected','removed','blacklisted')",email):fail(409,'Manage volunteer access through the Volunteers tab.')
     if email==u['email'] and (p.role!='admin' or not p.active): fail(409,'Cannot remove your own administrator access.')
     await write(db(req),u,'user.upsert',email,'INSERT INTO users(email,role,active,trained) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET role=excluded.role,active=excluded.active,trained=excluded.trained',email,p.role,int(p.active),int(p.trained));return {'email':email}
 @app.post('/api/training/acknowledge')
@@ -170,14 +177,39 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
     for r in rows:
         if r['status']=='complete':history.extend([{'role':'user','content':r['prompt']},{'role':'assistant','content':r['response']}])
     history.append({'role':'user','content':p.prompt})
+    if limits['context_chars_used']+len(p.prompt)>80000:fail(409,'Platform context safety limit reached. Start a new chat.')
     if not limits['no_limit'] and len(p.prompt)>limits['context_chars_remaining']: fail(409,f"Conversation context limit reached ({limits['max_context_chars']} characters). Shorten the message or finish the chat.")
-    allowance=await d.one("INSERT INTO model_daily_usage(email,day,requests) VALUES(?,date('now'),1) ON CONFLICT(email,day) DO UPDATE SET requests=requests+1 WHERE requests<50 RETURNING requests",u['email'])
-    if not allowance: fail(429,'Daily limit of 50 model requests reached.')
     id=uid();seq=rows[-1]['seq']+1 if rows else 1
-    # Atomic reservation: simultaneous sends cannot reserve the same sequence or another pending turn.
+    # Atomic D1 batch. Reserve only when all limits and account checks pass.
+    now=int(time.time()); minute=str(now//60); month=time.strftime('%Y-%m',time.gmtime(now)); day=time.strftime('%Y-%m-%d',time.gmtime(now))
+    ip=req.headers.get('CF-Connecting-IP','unknown')
+    ip_key=hashlib.sha256(('brite-ip-v1:'+ip).encode()).hexdigest()
+    size=limits['context_chars_used']+len(p.prompt)
     try:
-        await d.run('INSERT INTO turns(id,conversation_id,seq,prompt,status) VALUES(?,?,?,?,?)',id,c,seq,p.prompt,'pending')
+        await d.batch([
+          ("""INSERT INTO turns(id,conversation_id,seq,prompt,status)
+          SELECT ?,?,?,?,'pending' WHERE EXISTS(SELECT 1 FROM users WHERE email=? AND active=1 AND role='volunteer')
+          AND NOT EXISTS(SELECT 1 FROM volunteer_access WHERE email=? AND status!='approved')
+          AND EXISTS(SELECT 1 FROM safety_settings WHERE id=1 AND enabled=1)
+          AND COALESCE((SELECT requests FROM model_daily_usage WHERE email=? AND day=?),0)<50
+          AND COALESCE((SELECT requests FROM abuse_windows WHERE kind='user' AND subject=? AND window=?),0)<5
+          AND COALESCE((SELECT requests FROM abuse_windows WHERE kind='ip' AND subject=? AND window=?),0)<20
+          AND COALESCE((SELECT requests FROM model_monthly_usage WHERE month=?),0)<1000
+          AND NOT EXISTS(SELECT 1 FROM turns t JOIN conversations v ON v.id=t.conversation_id WHERE v.owner=? AND t.status='pending')""",(id,c,seq,p.prompt,u['email'],u['email'],u['email'],day,u['email'],minute,ip_key,minute,month,u['email'])),
+          ("""INSERT INTO model_daily_usage(email,day,requests) SELECT ?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
+            ON CONFLICT(email,day) DO UPDATE SET requests=requests+1""",(u['email'],day,id)),
+          ("""INSERT INTO abuse_windows(kind,subject,window,requests) SELECT 'user',?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
+            ON CONFLICT(kind,subject,window) DO UPDATE SET requests=requests+1""",(u['email'],minute,id)),
+          ("""INSERT INTO abuse_windows(kind,subject,window,requests) SELECT 'ip',?,?,1 WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
+            ON CONFLICT(kind,subject,window) DO UPDATE SET requests=requests+1""",(ip_key,minute,id)),
+          ("""INSERT INTO model_monthly_usage(month,requests,input_chars,output_token_allowance) SELECT ?,1,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)
+            ON CONFLICT(month) DO UPDATE SET requests=requests+1,input_chars=input_chars+excluded.input_chars,output_token_allowance=output_token_allowance+excluded.output_token_allowance""",(month,size,model['max_tokens'],id)),
+          ("""INSERT INTO model_usage(turn_id,email,scenario_id,model_id,input_chars,output_token_allowance) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM turns WHERE id=?)""",(id,u['email'],row['scenario_id'],row['model_id'],size,model['max_tokens'],id))
+        ])
     except Exception:fail(409,'Unable to reserve turn; refresh and retry.')
+    if not await d.one('SELECT id FROM turns WHERE id=?',id):
+        await d.batch([audit(u,'model.request_blocked',c)])
+        fail(429,'Model request blocked by usage limits, concurrent request, or administrator pause.')
     def event(kind,**data):return 'data: '+json.dumps({'type':kind,**data})+'\n\n'
     source=req.scope.get('brite_test_provider') or providers.chunks
     async def stream():
@@ -188,6 +220,7 @@ async def send(req:Request,c:str,p:PromptInput,u=Depends(current)):
                 if len(text)>100000: raise RuntimeError('Response too large')
                 yield event('delta',text=piece)
             changed=await d.run("UPDATE turns SET response=?,status='complete' WHERE id=? AND status='pending'",text,id)
+            await d.run('UPDATE model_usage SET output_chars=? WHERE turn_id=?',len(text),id)
             if changed!=1:raise RuntimeError('Turn expired')
             yield event('done',turn_id=id)
         except (Exception,asyncio.CancelledError) as exc:
@@ -266,6 +299,7 @@ class WorkspaceScenario(BaseModel):
     provider: Literal['openai','anthropic']
     model_name: str = Field(min_length=1,max_length=200)
     model_label: str = Field(min_length=1,max_length=200)
+    system_prompt: str = Field(default='',max_length=6000)
     no_limit: bool = Field(default=False,strict=True)
     max_turns: int | None = Field(default=None,ge=1,le=25,strict=True)
     max_context_chars: int | None = Field(default=None,ge=1000,le=80000,strict=True)
@@ -321,7 +355,7 @@ async def workspace_create(req:Request,p:WorkspaceScenario,u=Depends(current)):
     await d.batch([
         ("INSERT INTO campaigns(id,title,description,status,is_public) VALUES(?,?,?,'active',?)",(c,p.title.strip(),p.description.strip(),int(p.audience=='public'))),
         ('INSERT INTO scenarios(id,campaign_id,title,instructions,max_turns,max_context_chars,no_limit) VALUES(?,?,?,?,?,?,?)',(s,c,p.title.strip(),p.description.strip(),p.max_turns if p.max_turns is not None else 25,p.max_context_chars if p.max_context_chars is not None else 80000,int(p.no_limit))),
-        ('INSERT INTO models(id,campaign_id,label,provider,model_name) VALUES(?,?,?,?,?)',(m,c,p.model_label.strip(),p.provider,p.model_name.strip())),
+        ('INSERT INTO models(id,campaign_id,label,provider,model_name,system_prompt) VALUES(?,?,?,?,?,?)',(m,c,p.model_label.strip(),p.provider,p.model_name.strip(),p.system_prompt)),
         *assignments,audit(u,'scenario.create',s)
     ])
     return {'id':s,'campaign_id':c}
@@ -357,8 +391,9 @@ async def workspace_assign(req:Request,s:str,p:WorkspaceEmail,u=Depends(current)
 async def workspace_add_volunteer(req:Request,p:WorkspaceEmail,u=Depends(current)):
     role(u,'admin');d=db(req);e=normalize_email(p.email)
     existing=await d.one('SELECT role,active FROM users WHERE email=?',e)
-    if existing and (existing['role']!='volunteer' or not existing['active']): fail(409,'Email belongs to a different or inactive account.')
-    await d.batch([("INSERT OR IGNORE INTO users(email,role,active,trained) VALUES(?,'volunteer',1,0)",(e,)),audit(u,'volunteer.approve',e)])
+    if existing and existing['role']!='volunteer': fail(409,'Email belongs to a different account role.')
+    if await d.one("SELECT 1 FROM volunteer_access WHERE email=? AND status='blacklisted'",e):fail(409,'Unblock the email before approval.')
+    await approve_volunteer(d,u,e)
     return {'ok':True}
 
 @app.post('/api/workspace/conversations/{c}/flag')
@@ -386,3 +421,78 @@ async def workspace_catalog(req:Request,u=Depends(current)):
         except Exception:
             return {'provider':provider,'status':'unavailable','models':[]}
     return await asyncio.gather(load('openai'),load('anthropic'))
+
+
+# Verified identity is not authorization. Only this narrow route accepts unapproved identities.
+@app.post('/api/access/request')
+async def request_access(req:Request):
+    email=req.scope.get('brite_email')
+    if not email:fail(401,'Verify your email first.')
+    e=normalize_email(email);d=db(req)
+    user=await d.one('SELECT role,active FROM users WHERE email=?',e)
+    record=await d.one('SELECT status FROM volunteer_access WHERE email=?',e)
+    if user and user['active'] and (not record or record['status']=='approved'):return {'status':'approved'}
+    if record and record['status'] in ('blacklisted','rejected'):return {'status':record['status']}
+    await d.run("""INSERT INTO volunteer_access(email,status) VALUES(?,'pending')
+       ON CONFLICT(email) DO UPDATE SET status='pending',updated_at=CURRENT_TIMESTAMP WHERE status='removed'""",e)
+    record=await d.one('SELECT status FROM volunteer_access WHERE email=?',e)
+    return {'status':record['status']}
+
+async def approve_volunteer(d,u,e):
+    # Conditional SQL prevents a concurrent blacklist being silently overwritten.
+    await d.batch([
+      ("""INSERT INTO volunteer_access(email,status,decided_by) VALUES(?,'approved',?)
+        ON CONFLICT(email) DO UPDATE SET status='approved',decided_by=excluded.decided_by,updated_at=CURRENT_TIMESTAMP WHERE status!='blacklisted'""",(e,u['email'])),
+      ("""INSERT INTO users(email,role,active,trained) SELECT ?,'volunteer',1,0 WHERE EXISTS(SELECT 1 FROM volunteer_access WHERE email=? AND status='approved')
+        ON CONFLICT(email) DO UPDATE SET active=1 WHERE role='volunteer'""",(e,e)),
+      audit(u,'volunteer.approve',e)
+    ])
+
+class AccessDecision(BaseModel):
+    email: str = Field(min_length=3,max_length=254)
+    action: Literal['approve','reject','remove','blacklist','unblock']
+
+@app.get('/api/workspace/access-requests')
+async def access_requests(req:Request,u=Depends(current)):
+    role(u,'admin')
+    return await db(req).all('SELECT * FROM volunteer_access ORDER BY updated_at DESC LIMIT 500')
+
+@app.post('/api/workspace/access-decision')
+async def access_decision(req:Request,p:AccessDecision,u=Depends(current)):
+    role(u,'admin');d=db(req);e=normalize_email(p.email)
+    user=await d.one('SELECT role,active FROM users WHERE email=?',e)
+    if user and user['role']!='volunteer':fail(409,'Administrator and reviewer accounts are managed separately.')
+    record=await d.one('SELECT status FROM volunteer_access WHERE email=?',e)
+    if p.action=='approve':
+        if record and record['status']=='blacklisted':fail(409,'Unblock before approving.')
+        await approve_volunteer(d,u,e)
+    elif p.action=='unblock':
+        if not record or record['status']!='blacklisted':fail(409,'Email is not blacklisted.')
+        await write(d,u,'volunteer.unblock',e,"UPDATE volunteer_access SET status='removed',updated_at=CURRENT_TIMESTAMP,decided_by=? WHERE email=? AND status='blacklisted'",u['email'],e)
+    else:
+        status={'reject':'rejected','remove':'removed','blacklist':'blacklisted'}[p.action]
+        if record and record['status']=='blacklisted' and p.action!='blacklist':fail(409,'Unblock first.')
+        await d.batch([
+          ("UPDATE users SET active=0 WHERE email=? AND role='volunteer'",(e,)),
+          ("DELETE FROM memberships WHERE email=?",(e,)),
+          ("""INSERT INTO volunteer_access(email,status,decided_by) VALUES(?,?,?)
+            ON CONFLICT(email) DO UPDATE SET status=excluded.status,decided_by=excluded.decided_by,updated_at=CURRENT_TIMESTAMP WHERE status!='blacklisted' OR excluded.status='blacklisted'""",(e,status,u['email'])),
+          audit(u,'volunteer.'+p.action,e)
+        ])
+    return {'ok':True}
+
+class SafetyInput(BaseModel):
+    enabled: bool = Field(strict=True)
+
+@app.get('/api/workspace/safety')
+async def safety_status(req:Request,u=Depends(current)):
+    role(u,'admin');d=db(req)
+    settings=await d.one('SELECT enabled FROM safety_settings WHERE id=1')
+    usage=await d.one("SELECT * FROM model_monthly_usage WHERE month=strftime('%Y-%m','now')")
+    return {'enabled':bool(settings['enabled']),'monthly_requests':usage['requests'] if usage else 0,'monthly_request_limit':1000,'input_chars':usage['input_chars'] if usage else 0,'reserved_output_tokens':usage['output_token_allowance'] if usage else 0}
+
+@app.put('/api/workspace/safety')
+async def safety_update(req:Request,p:SafetyInput,u=Depends(current)):
+    role(u,'admin')
+    await write(db(req),u,'model.safety_toggle','global','UPDATE safety_settings SET enabled=? WHERE id=1',int(p.enabled))
+    return {'enabled':p.enabled}

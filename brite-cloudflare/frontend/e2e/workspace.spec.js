@@ -21,6 +21,7 @@ test('complete scenario workflow with isolated volunteer and flagged transcript'
  await expect(a.locator('#selected-count')).toHaveText('1 selected');
  await expect(a.locator('#catalog-state')).toContainText('No provider key configured');
  await a.locator('#model-name').fill('gpt-test');
+ await a.locator('#system-prompt').fill('Synthetic medical assistant');
  await expect(a.locator('#no-limit')).toBeChecked();
  await expect(a.locator('#max-turns')).toBeHidden();
  await a.locator('#no-limit').uncheck();

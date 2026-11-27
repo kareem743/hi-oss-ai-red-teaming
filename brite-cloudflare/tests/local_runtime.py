@@ -18,6 +18,7 @@ class LocalD1:
         self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0003_model_limits.sql').read_text())
         if 'max_turns' not in [r[1] for r in self.conn.execute('PRAGMA table_info(scenarios)')]:self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0004_scenario_limits.sql').read_text())
         if 'no_limit' not in [r[1] for r in self.conn.execute('PRAGMA table_info(scenarios)')]:self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0005_optional_limits.sql').read_text())
+        self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0006_access_security.sql').read_text())
     def prepare(self,sql):return Statement(self,sql)
     async def batch(self,stmts):
         with self.conn:

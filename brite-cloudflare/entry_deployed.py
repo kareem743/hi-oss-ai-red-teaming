@@ -20,7 +20,7 @@ class Default(WorkerEntrypoint):
             body = gzip.decompress(base64.b64decode(encoded)).decode('utf-8')
             headers = {'Content-Type': mime, 'Cache-Control': 'no-store',
                        'X-Content-Type-Options': 'nosniff', 'Vary': 'Accept-Encoding',
-                       'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}
+                       'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"}
             return Response(None if request.method == 'HEAD' else body, headers=headers)
         env = self.env
         email = await verified_email(request, env)

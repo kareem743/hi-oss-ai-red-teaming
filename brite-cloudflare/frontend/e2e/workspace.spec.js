@@ -30,8 +30,9 @@ test('complete scenario workflow with isolated volunteer and flagged transcript'
  await a.locator('#max-context').selectOption('2000');
  await a.getByRole('button',{name:/Create & publish/}).click();
  await expect(a.getByRole('heading',{name:'CI private scenario',exact:true})).toBeVisible();
- await expect(a.locator('.instructions')).toContainText('<img src=x onerror=alert(1)>');
+ await expect(a.locator('.instructions').filter({hasText:'Act as a fictional patient'})).toContainText('<img src=x onerror=alert(1)>');
  await expect(a.locator('.instructions img')).toHaveCount(0);
+ await expect(a.getByText('Synthetic medical assistant',{exact:true})).toBeVisible();
  const {c:vc,p:v}=await persona(browser,'volunteer@example.org');v.on('pageerror',e=>errors.push(e.message));
  await v.goto(base);await expect(v.getByRole('heading',{name:'My scenarios',exact:true})).toBeVisible();
  await expect(v.getByRole('button',{name:'Create scenario',exact:true})).toHaveCount(0);

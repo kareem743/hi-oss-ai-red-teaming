@@ -14,6 +14,7 @@ class LocalD1:
     def __init__(self,path=':memory:'):
         self.conn=sqlite3.connect(path,check_same_thread=False);self.conn.row_factory=sqlite3.Row;self.conn.execute('PRAGMA foreign_keys=ON')
         if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='users'").fetchone():self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0001_pilot.sql').read_text())
+        if 'is_public' not in [r[1] for r in self.conn.execute('PRAGMA table_info(campaigns)')]:self.conn.executescript((Path(__file__).resolve().parents[1]/'migrations/0002_scenario_audience.sql').read_text())
     def prepare(self,sql):return Statement(self,sql)
     async def batch(self,stmts):
         with self.conn:

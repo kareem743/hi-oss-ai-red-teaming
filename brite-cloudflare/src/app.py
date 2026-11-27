@@ -244,7 +244,7 @@ class WorkspaceScenario(BaseModel):
     title: str = Field(min_length=1,max_length=200)
     description: str = Field(min_length=1,max_length=12000)
     audience: Literal['public','private']
-    emails: list[str] = Field(default_factory=list,max_length=100)
+    emails: list[str] = Field(default_factory=list,max_length=20)
     provider: Literal['openai','anthropic']
     model_name: str = Field(min_length=1,max_length=200)
     model_label: str = Field(min_length=1,max_length=200)
@@ -328,7 +328,8 @@ async def workspace_detail(req:Request,s:str,u=Depends(current)):
 @app.post('/api/workspace/scenarios/{s}/assign')
 async def workspace_assign(req:Request,s:str,p:WorkspaceEmail,u=Depends(current)):
     role(u,'admin');d=db(req);row=await workspace_scenario(d,u,s)
-    await d.batch([*await workspace_assignment(d,u,row['campaign_id'],[p.email]),audit(u,'scenario.assign',s)])
+    items=await workspace_assignment(d,u,row['campaign_id'],[p.email])
+    await d.batch([*items,audit(u,'scenario.assign',s)])
     return {'ok':True}
 
 @app.post('/api/workspace/volunteers')

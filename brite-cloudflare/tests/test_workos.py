@@ -20,6 +20,7 @@ def test_workos_pkce_and_verified_identity(monkeypatch):
         scope['brite_env']=env;scope['brite_email']='admin@example.org' # forged/fallback edge identity must not authorize WorkOS mode
         await app(scope,receive,send)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=scoped),base_url=origin,headers={'Origin':origin},follow_redirects=False) as c:
+        assert (await c.get('/api/auth-config')).json()=={'mode':'workos','ready':True,'signed_in':False}
         assert (await c.get('/api/me')).status_code==401
         assert (await c.post('/api/access/request',json={})).status_code==401
         r=await c.get('/auth/workos/start');assert r.status_code==302
@@ -31,6 +32,7 @@ def test_workos_pkce_and_verified_identity(monkeypatch):
         c.cookies.set(workos.FLOW,cookie,domain='redteam.example.org',path='/')
         r=await c.get('/auth/workos/callback',params={'state':state,'code':'valid'});assert r.headers['location']=='/' and calls==[('valid',verifier)]
         assert c.cookies.get(workos.SESSION)
+        assert (await c.get('/api/auth-config')).json()['signed_in'] is True
         assert (await c.get('/api/me')).status_code==403
         assert (await c.post('/api/access/request',json={})).json()['status']=='pending'
         d.conn.execute("INSERT INTO users(email,role,trained) VALUES('new@example.org','volunteer',1)")

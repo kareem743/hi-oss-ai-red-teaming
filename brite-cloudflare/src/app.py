@@ -641,7 +641,7 @@ async def budget_update(req:Request,p:BudgetInput,u=Depends(current)):
 @app.get('/api/auth-config')
 async def auth_config(req:Request):
     env=req.scope['brite_env']
-    return {'mode':workos.mode(env),'ready':workos.ready(env)}
+    return {'mode':workos.mode(env),'ready':workos.ready(env),'signed_in':bool(req.scope.get('brite_email'))}
 
 @app.get('/auth/workos/start')
 async def workos_start(req:Request):

@@ -27,6 +27,8 @@ def challenge(verifier):return base64.urlsafe_b64encode(hashlib.sha256(verifier.
 def token():return secrets.token_hex(32)
 def valid_token(s):return isinstance(s,str) and re.fullmatch(r'[0-9a-f]{64}',s) is not None
 def fail(code='workos_callback_invalid'):
+    # Log a fixed diagnostic code only, never a URL, token, email or provider response.
+    print('BRITE WorkOS callback outcome: '+code)
     r=RedirectResponse('/?auth_error='+code,status_code=302,headers=HEADERS)
     r.delete_cookie(FLOW,**COOKIE_FLAGS)
     return r
@@ -112,6 +114,7 @@ async def finish(req,env):
     if valid_token(old):await d.run('DELETE FROM brite_workos_sessions WHERE token_hash=?',digest(old))
     await d.run('INSERT INTO brite_workos_sessions(token_hash,email,workos_user_id,workos_sid,expires_at) VALUES(?,?,?,?,?)',digest(t),email,wid,sid,now+86400)
     r=RedirectResponse('/?auth_notice=workos_verified' if m=='workos-preview' else '/',status_code=302,headers=HEADERS)
+    print('BRITE WorkOS callback outcome: session_created')
     r.set_cookie(SESSION,t,max_age=86400,**COOKIE_FLAGS)
     r.delete_cookie(FLOW,**COOKIE_FLAGS)
     return r

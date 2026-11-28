@@ -87,8 +87,20 @@ def test_native_exchange_transport(monkeypatch):
     assert kwargs['method']=='POST' and kwargs['redirect']=='manual'
     assert kwargs['headers']=={'Content-Type':'application/json'}
     assert json.loads(kwargs['body'])==dict(client_id='client_test',client_secret='sk_test',grant_type='authorization_code',code='example-code',code_verifier='example-verifier')
-    async def redirect(url,**kwargs):return SimpleNamespace(status=302)
+    async def redirect(url,**kwargs):
+        async def text():return ''
+        return SimpleNamespace(status=302,text=text,headers={})
     monkeypatch.setitem(sys.modules,'workers',SimpleNamespace(fetch=redirect))
     import pytest
     with pytest.raises(RuntimeError):await workos.exchange(env,'example-code','example-verifier')
  asyncio.run(go())
+
+
+def test_exchange_diagnostics_exclude_provider_secrets(capsys):
+    ref = 'req_01HZX91KDM4ZF5VA6983Q7VVRC'
+    body = json.dumps({'error':'invalid_grant','error_description':'Invalid code verifier for secret@example.org','pending_authentication_token':'secret'})
+    workos.exchange_rejection(400, body, ref)
+    assert capsys.readouterr().out.strip() == f'BRITE WorkOS exchange rejected: HTTP 400 reason=invalid_grant subject=pkce request_id={ref}'
+    for body in ('<html>private content</html>', 'null', '{"code":"private_value"}'):
+        workos.exchange_rejection(400, body, 'private_value')
+        assert capsys.readouterr().out.strip() == 'BRITE WorkOS exchange rejected: HTTP 400 reason=unclassified subject=unspecified request_id=unavailable'

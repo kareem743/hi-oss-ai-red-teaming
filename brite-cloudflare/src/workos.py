@@ -65,6 +65,35 @@ async def start(req,env):
     r.set_cookie(FLOW,state+'.'+verifier,max_age=600,**COOKIE_FLAGS)
     return r
 
+def exchange_rejection(status, body, request_id):
+    # The provider may include an email or pending authentication token in errors.
+    # Copy only known error identifiers and a validated provider request ID.
+    known = {
+        'invalid_grant', 'invalid_client', 'invalid_request', 'invalid_credentials',
+        'unauthorized_client', 'unsupported_grant_type', 'invalid_code',
+        'authentication_code_invalid', 'authentication_code_expired',
+        'invalid_code_verifier', 'code_verifier_missing', 'code_verifier_invalid',
+        'email_verification_required', 'mfa_challenge', 'organization_selection_required',
+        'access_denied', 'server_error', 'invalid_api_key', 'validation_error',
+    }
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    reason = next((data[key] for key in ('error', 'code') if isinstance(data.get(key), str) and data[key] in known), 'unclassified')
+    detail = ' '.join(str(data.get(key, '')) for key in ('code', 'error_description', 'message')).lower()
+    subject = next((label for word, label in (
+        ('verifier', 'pkce'), ('code challenge', 'pkce'), ('client secret', 'client_secret'),
+        ('client_secret', 'client_secret'), ('api key', 'api_key'), ('client id', 'client_id'),
+        ('client_id', 'client_id'), ('already used', 'used_code'), ('expired', 'expired'),
+        ('redirect', 'redirect_uri'), ('authorization code', 'authorization_code'),
+    ) if word in detail), 'unspecified')
+    ref = request_id if isinstance(request_id, str) and re.fullmatch(r'(?:req_|request_)?[0-9A-HJKMNP-TV-Z]{26}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', request_id, re.I) else 'unavailable'
+    print(f'BRITE WorkOS exchange rejected: HTTP {status} reason={reason} subject={subject} request_id={ref}')
+    return RuntimeError('WorkOS exchange rejected')
+
 async def exchange(env,code,verifier):
     # Use Cloudflare's Python-native fetch wrapper, not direct JS proxy conversion.
     url='https://api.workos.com/user_management/authenticate'
@@ -75,8 +104,7 @@ async def exchange(env,code,verifier):
         async with httpx.AsyncClient(timeout=httpx.Timeout(12,connect=5),follow_redirects=False) as client:
             r=await client.post(url,json=payload)
             if not r.is_success:
-                print('BRITE WorkOS exchange rejected: HTTP '+str(r.status_code))
-                raise RuntimeError('WorkOS exchange rejected')
+                raise exchange_rejection(r.status_code, r.text, r.headers.get('x-request-id'))
             return r.json()
     try:
         r=await fetch(url,method='POST',headers={'Content-Type':'application/json'},body=json.dumps(payload),redirect='manual')
@@ -85,8 +113,7 @@ async def exchange(env,code,verifier):
         print('BRITE WorkOS native fetch failed: '+type(exc).__name__)
         raise
     if not 200<=r.status<300:
-        print('BRITE WorkOS exchange rejected: HTTP '+str(r.status))
-        raise RuntimeError('WorkOS exchange rejected')
+        raise exchange_rejection(r.status, await r.text(), r.headers.get('x-request-id'))
     try:
         return json.loads(await r.text())
     except Exception as exc:

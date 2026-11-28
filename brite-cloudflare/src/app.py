@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel,Field
 from .db import DB
-from . import providers, vault, demo
+from . import providers, vault, demo, workos
 from types import SimpleNamespace
 app=FastAPI(title='BRITE | Red Teaming',version='0.2.0',docs_url=None,redoc_url=None,openapi_url=None)
 
@@ -20,7 +20,7 @@ def fail(code,msg): raise HTTPException(code,msg)
 def db(req): return DB(req.scope['brite_env'].DB)
 async def current(req:Request):
     email=req.scope.get('brite_email')
-    if not email: fail(401,'Sign in through Cloudflare Access.')
+    if not email: fail(401,'Sign in to BRITE.')
     user=await db(req).one('SELECT email,role,trained FROM users WHERE email=? AND active=1',email.lower())
     if not user or await db(req).one("SELECT 1 FROM volunteer_access WHERE email=? AND status IN ('pending','rejected','removed','blacklisted')",email.lower()): fail(403,'Your account has not been approved.')
     return user
@@ -62,6 +62,12 @@ async def security(req:Request,call_next):
             if len(received)+len(chunk)>128000:return Response('Request too large',413)
             received.extend(chunk)
         req._body=bytes(received)
+    env=req.scope.get('brite_env')
+    if env is not None:
+        auth_mode=workos.mode(env)
+        req.scope['brite_edge_email']=req.scope.get('brite_email')
+        if auth_mode=='workos':req.scope['brite_email']=await workos.identity(req,env)
+        elif auth_mode=='invalid':req.scope['brite_email']=None
     res=await call_next(req); res.headers['Cache-Control']='no-store';res.headers['X-Content-Type-Options']='nosniff';return res
 
 class UserInput(BaseModel):
@@ -328,6 +334,7 @@ async def reap(env):
     d=DB(env.DB)
     result=await d.run("UPDATE turns SET status='failed',error='Interrupted response (timeout)' WHERE status='pending' AND created_at < datetime('now','-10 minutes')")
     await d.run('DELETE FROM abuse_windows WHERE CAST(window AS INTEGER)<?',int(time.time())//60-1440)
+    await workos.cleanup(d)
     return result
 
 
@@ -629,3 +636,21 @@ async def model_register(req:Request,p:RegisteredModel,u=Depends(current)):
 async def budget_update(req:Request,p:BudgetInput,u=Depends(current)):
     role(u,'admin');await write(db(req),u,'api.budget_update','global','UPDATE api_budget SET budget_micros=? WHERE id=1',p.budget_cents*10000)
     return {'ok':True}
+
+
+@app.get('/api/auth-config')
+async def auth_config(req:Request):
+    env=req.scope['brite_env']
+    return {'mode':workos.mode(env),'ready':workos.ready(env)}
+
+@app.get('/auth/workos/start')
+async def workos_start(req:Request):
+    return await workos.start(req,req.scope['brite_env'])
+
+@app.get('/auth/workos/callback')
+async def workos_callback(req:Request):
+    return await workos.finish(req,req.scope['brite_env'])
+
+@app.post('/api/auth/logout')
+async def workos_logout(req:Request):
+    return await workos.logout(req,req.scope['brite_env'])

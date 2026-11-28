@@ -1,4 +1,4 @@
-"""Cloudflare single-host adapter. Identity is derived only from a validated Access JWT."""
+"""Cloudflare single-host adapter. Access identity is validated at the edge; WorkOS identity is resolved by the application only in explicit WorkOS mode."""
 from workers import WorkerEntrypoint,asgi
 from src.app import app,reap
 from src.access import verified_email

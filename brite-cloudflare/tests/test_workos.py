@@ -68,3 +68,27 @@ def test_workos_preview_does_not_replace_cloudflare(monkeypatch):
         assert not c.cookies.get(workos.SESSION)
         assert (await c.get('/api/me')).json()['role']=='admin'
  asyncio.run(go())
+
+
+def test_native_exchange_transport(monkeypatch):
+ import sys
+ async def go():
+    calls=[]
+    async def fetch(url,**kwargs):
+        calls.append((url,kwargs))
+        async def text():
+            return '{"user":{"id":"user_test","email_verified":true}}'
+        return SimpleNamespace(status=200,text=text)
+    monkeypatch.setitem(sys.modules,'workers',SimpleNamespace(fetch=fetch))
+    env=SimpleNamespace(WORKOS_CLIENT_ID='client_test',WORKOS_API_KEY='sk_test')
+    assert (await workos.exchange(env,'example-code','example-verifier'))['user']['email_verified']
+    url,kwargs=calls[0]
+    assert url=='https://api.workos.com/user_management/authenticate'
+    assert kwargs['method']=='POST' and kwargs['redirect']=='manual'
+    assert kwargs['headers']=={'Content-Type':'application/json'}
+    assert json.loads(kwargs['body'])==dict(client_id='client_test',client_secret='sk_test',grant_type='authorization_code',code='example-code',code_verifier='example-verifier')
+    async def redirect(url,**kwargs):return SimpleNamespace(status=302)
+    monkeypatch.setitem(sys.modules,'workers',SimpleNamespace(fetch=redirect))
+    import pytest
+    with pytest.raises(RuntimeError):await workos.exchange(env,'example-code','example-verifier')
+ asyncio.run(go())

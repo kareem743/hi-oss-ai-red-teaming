@@ -66,12 +66,11 @@ async def start(req,env):
     return r
 
 async def exchange(env,code,verifier):
-    # Use the Workers Fetch API (as in Medical Tool); local tests can use HTTPX.
+    # Use Cloudflare's Python-native fetch wrapper, not direct JS proxy conversion.
     url='https://api.workos.com/user_management/authenticate'
     payload=dict(client_id=str(env.WORKOS_CLIENT_ID),client_secret=str(env.WORKOS_API_KEY),grant_type='authorization_code',code=code,code_verifier=verifier)
     try:
-        from js import fetch,Object,AbortSignal
-        from pyodide.ffi import to_js
+        from workers import fetch
     except ImportError:
         async with httpx.AsyncClient(timeout=httpx.Timeout(12,connect=5),follow_redirects=False) as client:
             r=await client.post(url,json=payload)
@@ -79,12 +78,20 @@ async def exchange(env,code,verifier):
                 print('BRITE WorkOS exchange rejected: HTTP '+str(r.status_code))
                 raise RuntimeError('WorkOS exchange rejected')
             return r.json()
-    options=to_js({'method':'POST','headers':{'Content-Type':'application/json'},'body':json.dumps(payload),'redirect':'error','signal':AbortSignal.timeout(12000)},dict_converter=Object.fromEntries)
-    r=await fetch(url,options)
-    if not r.ok:
+    try:
+        r=await fetch(url,method='POST',headers={'Content-Type':'application/json'},body=json.dumps(payload),redirect='manual')
+    except Exception as exc:
+        # Fixed stage and exception class only; do not log request or response contents.
+        print('BRITE WorkOS native fetch failed: '+type(exc).__name__)
+        raise
+    if not 200<=r.status<300:
         print('BRITE WorkOS exchange rejected: HTTP '+str(r.status))
         raise RuntimeError('WorkOS exchange rejected')
-    return json.loads(await r.text())
+    try:
+        return json.loads(await r.text())
+    except Exception as exc:
+        print('BRITE WorkOS response decode failed: '+type(exc).__name__)
+        raise
 
 async def finish(req,env):
     m=mode(env)

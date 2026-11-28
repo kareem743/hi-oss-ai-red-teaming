@@ -67,6 +67,9 @@ test('unapproved and unauthenticated browser see no research navigation',async({
  for(const email of [null,'unapproved@example.org']){
    const {c,p}=await persona(browser,email);await p.goto(base);
    await expect(p.getByRole('link',{name:'Sign in with another email'})).toBeVisible();
+   await expect(p.locator('.login-story')).toContainText('Safer AI begins with');
+   await expect(p.locator('.login-story img')).toBeVisible();
+   await expect(p.locator('.login-form')).toBeVisible();
    await expect(p.getByRole('button',{name:'Create scenario',exact:true})).toHaveCount(0);
    await c.close();
  }

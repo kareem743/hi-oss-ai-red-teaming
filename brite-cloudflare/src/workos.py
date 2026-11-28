@@ -64,11 +64,25 @@ async def start(req,env):
     return r
 
 async def exchange(env,code,verifier):
-    # Same AuthKit authorization-code exchange as the Medical Tool. Never log secrets or response bodies.
-    async with httpx.AsyncClient(timeout=httpx.Timeout(12,connect=5),follow_redirects=False) as client:
-        r=await client.post('https://api.workos.com/user_management/authenticate',json=dict(client_id=str(env.WORKOS_CLIENT_ID),client_secret=str(env.WORKOS_API_KEY),grant_type='authorization_code',code=code,code_verifier=verifier))
-        r.raise_for_status()
-        return r.json()
+    # Use the Workers Fetch API (as in Medical Tool); local tests can use HTTPX.
+    url='https://api.workos.com/user_management/authenticate'
+    payload=dict(client_id=str(env.WORKOS_CLIENT_ID),client_secret=str(env.WORKOS_API_KEY),grant_type='authorization_code',code=code,code_verifier=verifier)
+    try:
+        from js import fetch,Object,AbortSignal
+        from pyodide.ffi import to_js
+    except ImportError:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12,connect=5),follow_redirects=False) as client:
+            r=await client.post(url,json=payload)
+            if not r.is_success:
+                print('BRITE WorkOS exchange rejected: HTTP '+str(r.status_code))
+                raise RuntimeError('WorkOS exchange rejected')
+            return r.json()
+    options=to_js({'method':'POST','headers':{'Content-Type':'application/json'},'body':json.dumps(payload),'redirect':'error','signal':AbortSignal.timeout(12000)},dict_converter=Object.fromEntries)
+    r=await fetch(url,options)
+    if not r.ok:
+        print('BRITE WorkOS exchange rejected: HTTP '+str(r.status))
+        raise RuntimeError('WorkOS exchange rejected')
+    return json.loads(await r.text())
 
 async def finish(req,env):
     m=mode(env)
@@ -82,7 +96,9 @@ async def finish(req,env):
     used=await d.one('DELETE FROM brite_workos_flows WHERE state_hash=? AND verifier_hash=? AND expires_at>? RETURNING state_hash',digest(state),digest(flow[1]),now)
     if not used:return fail()
     try:result=await exchange(env,code,flow[1])
-    except Exception:return fail('workos_unavailable')
+    except Exception as exc:
+        print('BRITE WorkOS exchange failed: '+type(exc).__name__)
+        return fail('workos_unavailable')
     user=result.get('user') if isinstance(result,dict) else None
     if not isinstance(user,dict):return fail('workos_identity_unverified')
     email=user.get('email');wid=user.get('id')
@@ -111,4 +127,6 @@ async def logout(req,env):
 
 async def cleanup(d):
     now=int(time.time())
-    await d.batch([('DELETE FROM brite_workos_flows WHERE expires_at<=?',(now,)),('DELETE FROM brite_workos_sessions WHERE expires_at<=?',(now,)),('DELETE FROM brite_workos_rate WHERE window<?',(now//60-1440,))])
+    await d.run('DELETE FROM brite_workos_flows WHERE expires_at<=?',now)
+    await d.run('DELETE FROM brite_workos_sessions WHERE expires_at<=?',now)
+    await d.run('DELETE FROM brite_workos_rate WHERE window<?',now//60-1440)

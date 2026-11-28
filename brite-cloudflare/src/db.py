@@ -15,10 +15,7 @@ class DB:
         return int(result.meta.changes)
     async def batch(self,items):
         statements=[self.stmt(sql,args) for sql,args in items]
-        try:
-            from pyodide.ffi import to_js
-            statements=to_js(statements)
-        except ImportError: pass
+        # The Workers binding unwraps each prepared statement when it converts this list.
         return await self.binding.batch(statements)
 
 def native(x):
